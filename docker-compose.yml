@@ -1,7 +1,11 @@
 services:
   routemaker:
-    build: .
-    image: routemaker:latest
+    # Pulls the published public image from GitHub Container Registry, so this
+    # file works standalone on any device with Docker — no source code needed.
+    # The multi-arch (amd64 + arm64) image is built and published by CI on every
+    # merge; Docker automatically pulls the variant matching the host.
+    image: ghcr.io/phdwight/routemaker:latest
+    pull_policy: always
     container_name: routemaker
     ports:
       - "8517:80"
