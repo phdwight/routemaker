@@ -2,8 +2,8 @@ services:
   routemaker:
     # Pulls the published public image from GitHub Container Registry, so this
     # file works standalone on any device with Docker — no source code needed.
-    # For local development that builds from source, add the build override:
-    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    # The multi-arch (amd64 + arm64) image is built and published by CI on every
+    # merge; Docker automatically pulls the variant matching the host.
     image: ghcr.io/phdwight/routemaker:latest
     pull_policy: always
     container_name: routemaker
