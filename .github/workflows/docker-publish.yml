@@ -3,7 +3,18 @@ name: Build & Publish Docker image
 on:
   push:
     branches: [main, develop]
+    # Only rebuild when something that actually ends up in the image changes.
+    # Docs-only edits (e.g. README.md) are ignored, so no needless republish.
+    paths:
+      - "index.html"
+      - "style.css"
+      - "app.js"
+      - "Dockerfile"
+      - "nginx.conf"
+      - ".dockerignore"
+      - ".github/workflows/docker-publish.yml"
     tags: ["v*.*.*"]
+  # Manual escape hatch — e.g. to publish a release tagged on a docs-only commit.
   workflow_dispatch:
 
 env:
