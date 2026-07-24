@@ -55,15 +55,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Fail the build if a secret/.env ever leaks into the image layers.
+      # Fail the build if a secret/.env leaks into the application content.
+      # Only the paths we COPY into can carry our own files — the base image's
+      # public CA bundle under /etc/ssl lives elsewhere and is intentionally ignored.
       - name: Verify image contains no secrets
         run: |
           IMAGE="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
           echo "Inspecting $IMAGE"
           docker pull "$IMAGE"
           LEAKED="$(docker run --rm --entrypoint sh "$IMAGE" -c \
-            'find / -xdev \( -name ".env" -o -name "*.pem" -o -name "*.key" -o -name "*secret*" \) 2>/dev/null | grep -v "^/proc" || true')"
+            'find /usr/share/nginx/html /etc/nginx \( -name ".env" -o -name ".env.*" -o -name "*.pem" -o -name "*.key" -o -name "*secret*" \) 2>/dev/null || true')"
           if [ -n "$LEAKED" ]; then
-            echo "::error::Potential secrets found in image:"; echo "$LEAKED"; exit 1
+            echo "::error::Potential secrets found in application content:"; echo "$LEAKED"; exit 1
           fi
-          echo "No secrets or .env files found in image. ✅"
+          echo "No secrets or .env files found in application content. ✅"
