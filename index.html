@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>RouteMaker — Rail Map Designer</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -71,8 +71,9 @@
         <div class="sec-head"><h2 id="props-title">Properties</h2></div>
         <div id="props"><p class="hint">Select a line, or a station point, to edit it.<br><br>
           <b>Station tool:</b> click anywhere on a line to add a station there; click an existing station to edit it.<br>
-          <b>Draw tool:</b> click to place points, click the first point to close a loop, double-click / Enter to finish. Click an endpoint of an existing line to extend it.<br>
-          <b>Select tool:</b> drag points to move, ⌥-drag or double-click a segment to add a bend point.</p></div>
+          <b>Draw tool:</b> click/tap to place points, tap the first point to close a loop, double-click / double-tap / Enter (or the ✓ Finish button) to finish. Click an endpoint of an existing line to extend it.<br>
+          <b>Select tool:</b> drag points to move, ⌥-drag or double-click / double-tap a segment to add a bend point.<br>
+          <b>Touch / Pencil:</b> draw and drag with one finger or the Apple Pencil; pinch with two fingers to zoom and pan.</p></div>
       </section>
     </aside>
 
@@ -99,6 +100,7 @@
           <g id="layer-overlay"></g>
         </g>
       </svg>
+      <button id="btn-finish-line" class="canvas-fab hidden" title="Finish line (double-tap / Enter)">✓ Finish line</button>
       <div id="statusbar"><span id="status-hint"></span><span id="status-zoom"></span></div>
     </div>
   </div>

@@ -685,6 +685,7 @@ function renderOverlay() {
       }));
     }
   }
+  if (typeof syncCanvasControls === "function") syncCanvasControls();
 }
 
 function applyView() {
@@ -1009,7 +1010,38 @@ function cancelDrawing(rerender = true) {
   if (rerender) renderAll();
 }
 
-svg.addEventListener("mousedown", (e) => {
+// ------------------------------------------------------------ pointer input
+// Pointer Events unify mouse, pen (Apple Pencil) and touch behind one path, so
+// desktop behaviour is unchanged while iPad/Pencil gets first-class support.
+const activePointers = new Map(); // pointerId -> { x, y }
+let pinch = null;                 // two-finger zoom/pan gesture
+let lastTap = null;               // pen/touch double-tap detector: { t, x, y }
+let lastDoubleAt = 0;             // guard so a synthesized dblclick can't double-fire
+
+function onPointerDown(e) {
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  // A second touch starts a pinch-zoom / two-finger pan; abort any single-pointer op.
+  if (e.pointerType === "touch" && activePointers.size === 2) {
+    if (mouse) { mouse = null; svg.classList.remove("panning"); }
+    const [a, b] = [...activePointers.values()];
+    const r = svg.getBoundingClientRect();
+    const mcx = (a.x + b.x) / 2 - r.left, mcy = (a.y + b.y) / 2 - r.top;
+    pinch = {
+      startDist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      startScale: state.view.scale,
+      worldX: (mcx - state.view.x) / state.view.scale,
+      worldY: (mcy - state.view.y) / state.view.scale,
+    };
+    if (drawing) { drawing.cursor = null; renderOverlay(); }
+    e.preventDefault();
+    return;
+  }
+  if (activePointers.size > 1) return; // ignore a 3rd+ finger mid-gesture
+
+  try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+
+  // Middle-button, or space+drag, pans (desktop mouse).
   if (e.button === 1 || (e.button === 0 && spaceDown)) {
     mouse = { mode: "pan", startClient: [e.clientX, e.clientY], startView: { ...state.view } };
     svg.classList.add("panning");
@@ -1017,6 +1049,19 @@ svg.addEventListener("mousedown", (e) => {
     return;
   }
   if (e.button !== 0) return;
+
+  // Pen/touch double-tap mirrors mouse double-click (finish line / add bend / station).
+  if (e.pointerType !== "mouse") {
+    const now = performance.now();
+    if (lastTap && now - lastTap.t < 300 &&
+        Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 24) {
+      lastTap = null;
+      activateDouble(e.clientX, e.clientY);
+      return;
+    }
+    lastTap = { t: now, x: e.clientX, y: e.clientY };
+  }
+
   const w = toWorld(e.clientX, e.clientY);
 
   if (state.tool === "draw") {
@@ -1104,9 +1149,27 @@ svg.addEventListener("mousedown", (e) => {
   } else {
     mouse = { mode: "panMaybe", startClient: [e.clientX, e.clientY], startView: { ...state.view }, moved: false };
   }
-});
+}
 
-window.addEventListener("mousemove", (e) => {
+function onPointerMove(e) {
+  if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (pinch) {
+    const pts = [...activePointers.values()];
+    if (pts.length >= 2) {
+      const [a, b] = pts;
+      const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+      const r = svg.getBoundingClientRect();
+      const mcx = (a.x + b.x) / 2 - r.left, mcy = (a.y + b.y) / 2 - r.top;
+      const s1 = Math.min(4, Math.max(0.15, pinch.startScale * dist / pinch.startDist));
+      state.view.scale = s1;
+      state.view.x = mcx - pinch.worldX * s1;
+      state.view.y = mcy - pinch.worldY * s1;
+      applyView(); renderOverlay();
+    }
+    return;
+  }
+
   if (state.tool === "draw" && drawing) {
     const line = lineById(drawing.lineId);
     if (line && line.points.length) {
@@ -1142,9 +1205,15 @@ window.addEventListener("mousemove", (e) => {
     });
     renderScene();
   }
-});
+}
 
-window.addEventListener("mouseup", () => {
+function onPointerUp(e) {
+  activePointers.delete(e.pointerId);
+  try { svg.releasePointerCapture(e.pointerId); } catch (_) {}
+  if (pinch) {
+    if (activePointers.size < 2) pinch = null;
+    return; // a pinch never falls through to click/drag cleanup
+  }
   if (!mouse) return;
   const wasClickOnEmpty = mouse.mode === "panMaybe" && !mouse.moved;
   const mutated = (mouse.mode === "movePoint" || mouse.mode === "moveLine") && mouse.moved;
@@ -1156,10 +1225,18 @@ window.addEventListener("mouseup", () => {
   } else if (mutated) {
     renderAll();
   }
-});
+}
 
-svg.addEventListener("dblclick", (e) => {
-  const w = toWorld(e.clientX, e.clientY);
+svg.addEventListener("pointerdown", onPointerDown);
+window.addEventListener("pointermove", onPointerMove);
+window.addEventListener("pointerup", onPointerUp);
+window.addEventListener("pointercancel", onPointerUp);
+
+// Double-activate: finish a line, or add a bend/station. Reached by mouse
+// double-click and by the pen/touch double-tap detected in onPointerDown.
+function activateDouble(clientX, clientY) {
+  lastDoubleAt = performance.now();
+  const w = toWorld(clientX, clientY);
   if (state.tool === "draw") { finishDrawing(); return; }
   const hit = hitTest(w);
   if (hit && hit.type === "point") {
@@ -1177,12 +1254,29 @@ svg.addEventListener("dblclick", (e) => {
     state.selection = { lineId: hit.line.id, pointIndex: hit.index + 1 };
     renderAll();
   }
+}
+
+svg.addEventListener("dblclick", (e) => {
+  // Mouse double-click; pen/touch is already handled via double-tap in onPointerDown.
+  if (performance.now() - lastDoubleAt < 500) return;
+  activateDouble(e.clientX, e.clientY);
 });
 
 svg.addEventListener("contextmenu", (e) => {
   e.preventDefault();
   if (drawing) finishDrawing();
 });
+
+// On-canvas "Finish line" affordance — pen/touch have no double-click or Enter key.
+// Shown only while an open line with ≥2 points is being drawn.
+document.getElementById("btn-finish-line").addEventListener("click", () => finishDrawing());
+function syncCanvasControls() {
+  const btn = document.getElementById("btn-finish-line");
+  if (!btn) return;
+  const active = state.tool === "draw" && !!drawing &&
+    (lineById(drawing.lineId)?.points.length || 0) >= 2;
+  btn.classList.toggle("hidden", !active);
+}
 
 svg.addEventListener("wheel", (e) => {
   e.preventDefault();
