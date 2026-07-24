@@ -1,9 +1,29 @@
-.claude/
+# The Dockerfile COPYs only index.html, style.css, app.js and nginx.conf,
+# so nothing else can enter the image. These rules are defense-in-depth to
+# keep the build context small and secrets out even if the Dockerfile changes.
+
+# VCS / tooling
 .git/
 .gitignore
+.github/
+.claude/
 .python-version
-README.md
-Dockerfile
-docker-compose.yml
-.dockerignore
+
+# Docs & Docker metadata
 *.md
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Secrets & environment — never ship these
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+**/*secret*
+
+# OS / editor cruft
+.DS_Store
+*.swp
