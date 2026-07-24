@@ -1,0 +1,6 @@
+# OS / editor
+.DS_Store
+*.swp
+
+# Local Claude Code config
+.claude/

@@ -1,0 +1,9 @@
+.claude/
+.git/
+.gitignore
+.python-version
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+*.md

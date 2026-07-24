@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RouteMaker — Rail Map Designer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">🚆 <strong>RouteMaker</strong></div>
+
+    <div class="menu-wrap">
+      <button id="btn-file">☰ File</button>
+      <div id="file-menu" class="menu hidden">
+        <button data-act="new">＋&nbsp; New map</button>
+        <button data-act="open">📂&nbsp; Open map…</button>
+        <button data-act="import">⬆️&nbsp; Import JSON file…</button>
+        <hr>
+        <button data-act="json">💾&nbsp; Save as JSON file</button>
+        <button data-act="svg">🖼️&nbsp; Export as SVG</button>
+        <button data-act="png">🌄&nbsp; Export as PNG</button>
+        <hr>
+        <button data-act="sample">✨&nbsp; New from sample map</button>
+        <button data-act="clear">🗑️&nbsp; Clear all lines</button>
+      </div>
+    </div>
+
+    <input id="map-name" value="Untitled Map" title="Map name — click to rename" spellcheck="false">
+
+    <div class="tool-group" id="tools">
+      <button id="tool-select" class="tool active" title="Select / edit (V)">⬚ Select</button>
+      <button id="tool-draw" class="tool" title="Draw line (D)">✏️ Draw</button>
+      <button id="tool-station" class="tool" title="Add station (S) — click anywhere on a line">◉ Station</button>
+    </div>
+    <div class="tool-group">
+      <label class="chk"><input type="checkbox" id="opt-grid" checked> Grid</label>
+      <label class="chk"><input type="checkbox" id="opt-snap45" checked> 45° snap</label>
+      <label class="chk"><input type="checkbox" id="opt-linenames" checked> Line names</label>
+      <label class="chk"><input type="checkbox" id="opt-legend" checked> Legend</label>
+    </div>
+    <div class="tool-group">
+      <button id="btn-undo" title="Undo (⌘Z)">↩︎</button>
+      <button id="btn-redo" title="Redo (⇧⌘Z)">↪︎</button>
+      <button id="btn-zoom-out" title="Zoom out">−</button>
+      <button id="btn-zoom-in" title="Zoom in">＋</button>
+      <button id="btn-fit" title="Fit map">⛶ Fit</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="menu-wrap">
+      <button id="btn-export" class="accent">⬇ Export</button>
+      <div id="export-menu" class="menu right hidden">
+        <button data-act="svg">Vector image (.svg)</button>
+        <button data-act="png">Image (.png)</button>
+        <button data-act="json">Map project file (.json)</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="main">
+    <aside id="sidebar">
+      <section>
+        <div class="sec-head">
+          <h2>Lines</h2>
+          <button id="btn-new-line" class="accent">+ New line</button>
+        </div>
+        <ul id="line-list"></ul>
+      </section>
+
+      <section id="props-section">
+        <div class="sec-head"><h2 id="props-title">Properties</h2></div>
+        <div id="props"><p class="hint">Select a line, or a station point, to edit it.<br><br>
+          <b>Station tool:</b> click anywhere on a line to add a station there; click an existing station to edit it.<br>
+          <b>Draw tool:</b> click to place points, click the first point to close a loop, double-click / Enter to finish. Click an endpoint of an existing line to extend it.<br>
+          <b>Select tool:</b> drag points to move, ⌥-drag or double-click a segment to add a bend point.</p></div>
+      </section>
+    </aside>
+
+    <div id="canvas-wrap">
+      <svg id="canvas" tabindex="0">
+        <defs>
+          <pattern id="gridpat" width="10" height="10" patternUnits="userSpaceOnUse">
+            <path d="M 10 0 L 0 0 0 10" fill="none" stroke="#eeeae0" stroke-width="1"/>
+          </pattern>
+          <pattern id="gridpat-mid" width="50" height="50" patternUnits="userSpaceOnUse">
+            <rect width="50" height="50" fill="url(#gridpat)"/>
+            <path d="M 50 0 L 0 0 0 50" fill="none" stroke="#e3ded0" stroke-width="1"/>
+          </pattern>
+          <pattern id="gridpat-major" width="100" height="100" patternUnits="userSpaceOnUse">
+            <rect width="100" height="100" fill="url(#gridpat-mid)"/>
+            <path d="M 100 0 L 0 0 0 100" fill="none" stroke="#d9d4c4" stroke-width="1"/>
+          </pattern>
+        </defs>
+        <g id="world">
+          <rect id="grid-rect" x="-10000" y="-10000" width="20000" height="20000" fill="url(#gridpat-major)"/>
+          <g id="layer-lines"></g>
+          <g id="layer-linelabels"></g>
+          <g id="layer-stations"></g>
+          <g id="layer-overlay"></g>
+        </g>
+      </svg>
+      <div id="statusbar"><span id="status-hint"></span><span id="status-zoom"></span></div>
+    </div>
+  </div>
+
+  <div id="open-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>Open map</h3>
+        <button id="open-close" title="Close">✕</button>
+      </div>
+      <ul id="map-list"></ul>
+      <div class="modal-foot">Maps are saved automatically in this browser as you edit.</div>
+    </div>
+  </div>
+
+  <input type="file" id="file-input" accept=".json" hidden>
+
+<script src="app.js"></script>
+</body>
+</html>

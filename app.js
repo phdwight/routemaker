@@ -1,0 +1,1600 @@
+/* RouteMaker — rail map designer */
+"use strict";
+
+// ---------------------------------------------------------------- constants
+const GRID = 10; // snap step — fine enough to lay parallel lines nearly touching
+const PALETTE = [
+  "#E6002D", "#F15A22", "#F6AA00", "#EFC800", "#8FC31F", "#2E9A44",
+  "#00A7A8", "#00B2E3", "#0072BC", "#1A2E8C", "#7B1FA2", "#E85298",
+  "#8B5A2B", "#5A5A5A", "#111111",
+];
+const DIRS = {
+  e:  [1, 0], w: [-1, 0], n: [0, -1], s: [0, 1],
+  ne: [0.72, -0.72], nw: [-0.72, -0.72], se: [0.72, 0.72], sw: [-0.72, 0.72],
+};
+const LINE_STYLES = [
+  ["solid", "Solid"],
+  ["stripe", "Shinkansen stripe"],
+  ["dashed", "Dashed"],
+  ["dotted", "Dotted"],
+  ["broken", "Broken (white ticks)"],
+  ["hollow", "Hollow (white core)"],
+  ["double", "Double track"],
+  ["edged", "Edged (dark outline)"],
+  ["hatch", "Diagonal hatch"],
+  ["zigzag", "Zigzag"],
+];
+const CORRIDOR_GAP = 1;   // hairline seam between parallel lines sharing a corridor
+const MAPS_KEY = "routemaker.maps.v1";
+const CUR_KEY = "routemaker.current.v1";
+const LEGACY_KEY = "routemaker.v1"; // pre-multi-map single save slot
+
+// ---------------------------------------------------------------- state
+let state = {
+  lines: [],           // {id,name,color,width,badge,style,corner,closed,points:[{x,y,station}]}
+  tool: "select",
+  selection: null,     // {lineId, pointIndex?} | null
+  view: { x: 40, y: 20, scale: 1 },
+  showGrid: true, snap45: true, showLineNames: true, showLegend: true,
+};
+let drawing = null;    // {lineId} while draw tool is placing points
+let nextId = 1;
+const undoStack = [], redoStack = [];
+let geomCache = new Map(); // lineId -> rendered (corridor-offset) points
+
+const svg = document.getElementById("canvas");
+const world = document.getElementById("world");
+const layers = {
+  lines: document.getElementById("layer-lines"),
+  linelabels: document.getElementById("layer-linelabels"),
+  stations: document.getElementById("layer-stations"),
+  overlay: document.getElementById("layer-overlay"),
+};
+const gridRect = document.getElementById("grid-rect");
+const measureCtx = document.createElement("canvas").getContext("2d");
+
+// ---------------------------------------------------------------- helpers
+const uid = () => "L" + nextId++;
+function el(tag, attrs = {}, text) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  if (text != null) n.textContent = text;
+  return n;
+}
+const snap = (v) => Math.round(v / GRID) * GRID;
+const lineById = (id) => state.lines.find((l) => l.id === id);
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const fmt = (v) => Math.round(v * 100) / 100;
+const lineStyle = (l) => l.style || "solid";
+const lineCorner = (l) => (l.corner == null ? 16 : l.corner);
+
+function toWorld(clientX, clientY) {
+  const r = svg.getBoundingClientRect();
+  return {
+    x: (clientX - r.left - state.view.x) / state.view.scale,
+    y: (clientY - r.top - state.view.y) / state.view.scale,
+  };
+}
+
+// Octilinear snap of point p relative to anchor a
+function snapOcta(a, p) {
+  const dx = p.x - a.x, dy = p.y - a.y;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+  if (adx < ady / 2) return { x: a.x, y: a.y + snap(dy) };            // vertical
+  if (ady < adx / 2) return { x: a.x + snap(dx), y: a.y };            // horizontal
+  const k = snap((adx + ady) / 2);                                    // diagonal
+  return { x: a.x + Math.sign(dx) * k, y: a.y + Math.sign(dy) * k };
+}
+
+function distToSegment(p, a, b) {
+  const vx = b.x - a.x, vy = b.y - a.y;
+  const len2 = vx * vx + vy * vy;
+  let t = len2 ? ((p.x - a.x) * vx + (p.y - a.y) * vy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const qx = a.x + t * vx, qy = a.y + t * vy;
+  return { d: Math.hypot(p.x - qx, p.y - qy), t, x: qx, y: qy };
+}
+
+function measureText(text, size, weight) {
+  measureCtx.font = `${weight || 400} ${size}px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif`;
+  return measureCtx.measureText(text).width;
+}
+
+function darken(hex, f = 0.62) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return "#333";
+  const n = parseInt(m[1], 16);
+  const r = Math.round(((n >> 16) & 255) * f), g = Math.round(((n >> 8) & 255) * f), b = Math.round((n & 255) * f);
+  return "#" + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
+}
+
+// ---- texture pattern paints (diagonal hatch / zigzag), one def per color
+let sceneDefs = el("defs"), scenePatterns = new Map();
+function ensurePattern(kind, color) {
+  const key = kind + color;
+  if (scenePatterns.has(key)) return scenePatterns.get(key);
+  const id = "pat-" + kind + "-" + color.replace(/[^0-9a-zA-Z]/g, "");
+  let pat;
+  if (kind === "hatch") {
+    pat = el("pattern", { id, width: 7, height: 7, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" });
+    pat.append(el("rect", { width: 7, height: 7, fill: color }));
+    pat.append(el("rect", { width: 7, height: 1.8, fill: "rgba(255,255,255,0.75)" }));
+  } else { // zigzag
+    pat = el("pattern", { id, width: 12, height: 12, patternUnits: "userSpaceOnUse" });
+    pat.append(el("rect", { width: 12, height: 12, fill: color }));
+    pat.append(el("path", {
+      d: "M0 8.5 L3 4.5 L6 8.5 L9 4.5 L12 8.5", fill: "none",
+      stroke: "rgba(255,255,255,0.85)", "stroke-width": 1.4,
+    }));
+  }
+  sceneDefs.append(pat);
+  scenePatterns.set(key, id);
+  return id;
+}
+
+// Draws a path with the line's texture into g (used by the map and the legend).
+function drawTexturedPath(g, d, line, w) {
+  const color = line.color, style = lineStyle(line);
+  const push = (attrs) => g.append(el("path", Object.assign(
+    { d, fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round" }, attrs)));
+  switch (style) {
+    case "dashed":
+      push({ stroke: color, "stroke-width": w, "stroke-dasharray": `${w * 1.8} ${w * 1.1}`, "stroke-linecap": "butt" });
+      break;
+    case "dotted":
+      push({ stroke: color, "stroke-width": w, "stroke-dasharray": `0.1 ${w * 1.7}` });
+      break;
+    case "hatch":
+    case "zigzag":
+      push({ stroke: `url(#${ensurePattern(style, color)})`, "stroke-width": w });
+      break;
+    case "edged":
+      push({ stroke: darken(color), "stroke-width": w + 3.5 });
+      push({ stroke: color, "stroke-width": Math.max(1.5, w - 1.5) });
+      break;
+    default:
+      push({ stroke: color, "stroke-width": w });
+  }
+  if (style === "stripe") {
+    push({ stroke: "#fff", "stroke-width": Math.max(1.4, w * 0.42),
+           "stroke-dasharray": `${w * 0.9} ${w * 0.9}`, "stroke-linecap": "butt" });
+  } else if (style === "hollow") {
+    push({ stroke: "#fff", "stroke-width": Math.max(1.5, w - 4.5) });
+  } else if (style === "double") {
+    push({ stroke: "#fbfaf5", "stroke-width": Math.max(1.5, w * 0.45), "stroke-linecap": "butt" });
+  } else if (style === "broken") {
+    push({ stroke: "#fff", "stroke-width": w, "stroke-dasharray": `2.2 ${w * 1.9}`, "stroke-linecap": "butt" });
+  }
+}
+
+// ---------------------------------------------------------------- undo/redo
+function snapshot() {
+  undoStack.push(clone(state.lines));
+  if (undoStack.length > 100) undoStack.shift();
+  redoStack.length = 0;
+}
+function undo() {
+  if (!undoStack.length) return;
+  redoStack.push(clone(state.lines));
+  state.lines = undoStack.pop();
+  cancelDrawing(false);
+  validateSelection();
+  renderAll();
+}
+function redo() {
+  if (!redoStack.length) return;
+  undoStack.push(clone(state.lines));
+  state.lines = redoStack.pop();
+  validateSelection();
+  renderAll();
+}
+function validateSelection() {
+  if (!state.selection) return;
+  const l = lineById(state.selection.lineId);
+  if (!l) state.selection = null;
+  else if (state.selection.pointIndex != null && state.selection.pointIndex >= l.points.length)
+    state.selection = { lineId: l.id };
+}
+
+// ---------------------------------------------------------------- persistence
+// Maps live in localStorage under MAPS_KEY: {maps:[{id,name,updatedAt,lines}]}.
+// The current map's slot is updated automatically on every edit.
+let currentMapId = null;
+
+function loadStore() {
+  try {
+    const s = JSON.parse(localStorage.getItem(MAPS_KEY));
+    if (s && Array.isArray(s.maps)) return s;
+  } catch (e) { /* fall through */ }
+  return { maps: [] };
+}
+function saveStore(s) {
+  try { localStorage.setItem(MAPS_KEY, JSON.stringify(s)); } catch (e) { /* ignore */ }
+}
+function currentMapName() {
+  return document.getElementById("map-name").value.trim() || "Untitled Map";
+}
+function serialize() {
+  return JSON.stringify({ app: "routemaker", version: 1, name: currentMapName(), lines: state.lines }, null, 2);
+}
+function autosave() {
+  const s = loadStore();
+  const m = s.maps.find((x) => x.id === currentMapId);
+  if (!m) return;
+  m.lines = state.lines;
+  m.name = currentMapName();
+  m.updatedAt = Date.now();
+  saveStore(s);
+}
+function clearHistory() { undoStack.length = 0; redoStack.length = 0; }
+function setLines(lines) {
+  state.lines = lines;
+  let maxN = 0;
+  for (const l of state.lines) {
+    const m = /^L(\d+)$/.exec(l.id);
+    if (m) maxN = Math.max(maxN, +m[1]);
+  }
+  nextId = maxN + 1;
+  state.selection = null;
+  cancelDrawing(false);
+  clearHistory();
+}
+function createMap(name, lines) {
+  const s = loadStore();
+  const id = "M" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  s.maps.push({ id, name, updatedAt: Date.now(), lines: clone(lines) });
+  saveStore(s);
+  currentMapId = id;
+  try { localStorage.setItem(CUR_KEY, id); } catch (e) { /* ignore */ }
+  document.getElementById("map-name").value = name;
+  setLines(clone(lines));
+  renderAll();
+  fitView();
+}
+function openMap(id) {
+  const s = loadStore();
+  const m = s.maps.find((x) => x.id === id);
+  if (!m) return;
+  currentMapId = id;
+  try { localStorage.setItem(CUR_KEY, id); } catch (e) { /* ignore */ }
+  document.getElementById("map-name").value = m.name;
+  setLines(clone(m.lines));
+  renderAll();
+  fitView();
+}
+function deleteMap(id) {
+  const s = loadStore();
+  s.maps = s.maps.filter((m) => m.id !== id);
+  saveStore(s);
+  if (currentMapId === id) {
+    const rest = [...s.maps].sort((a, b) => b.updatedAt - a.updatedAt);
+    if (rest.length) openMap(rest[0].id);
+    else createMap("Untitled Map", []);
+  }
+}
+function untitledName() {
+  const s = loadStore();
+  let n = 1, name = "Untitled Map";
+  while (s.maps.some((m) => m.name === name)) name = "Untitled Map " + ++n;
+  return name;
+}
+function parseMapFile(json) {
+  const data = JSON.parse(json);
+  if (!Array.isArray(data.lines)) throw new Error("Not a RouteMaker file");
+  return data;
+}
+
+// ---------------------------------------------------------------- geometry
+// Segments shared by several lines (same two grid points) fan out into
+// parallel tracks. Returns Map lineId -> rendered points.
+function computeGeometry() {
+  const groups = new Map(); // canonical segment key -> {ux,uy,members:[{li,i,width}]}
+  state.lines.forEach((line, li) => {
+    const pts = line.points, n = pts.length;
+    const segCount = line.closed ? n : n - 1;
+    for (let i = 0; i < segCount; i++) {
+      const a = pts[i], b = pts[(i + 1) % n];
+      if (a.x === b.x && a.y === b.y) continue;
+      const swapped = b.x < a.x || (b.x === a.x && b.y < a.y);
+      const p = swapped ? b : a, q = swapped ? a : b;
+      const key = p.x + "," + p.y + "|" + q.x + "," + q.y;
+      if (!groups.has(key)) {
+        const len = Math.hypot(q.x - p.x, q.y - p.y);
+        groups.set(key, { ux: -(q.y - p.y) / len, uy: (q.x - p.x) / len, members: [] });
+      }
+      // sign: does this line travel the segment along canonical order or against it?
+      groups.get(key).members.push({ li, i, width: line.width, sign: swapped ? -1 : 1 });
+    }
+  });
+
+  // per-line, per-segment perpendicular offset vectors. Offsets are oriented by
+  // each line's direction of travel (sign) so a track stays on the same side
+  // through corners instead of swapping and crossing its neighbor.
+  const offsets = state.lines.map((l) => l.points.map(() => ({ x: 0, y: 0 })));
+  for (const { ux, uy, members } of groups.values()) {
+    if (members.length < 2) continue;
+    members.sort((A, B) => A.li - B.li);
+    const spacing = Math.max(...members.map((M) => M.width)) + CORRIDOR_GAP;
+    let lat = members.map((M, k) => (k - (members.length - 1) / 2) * spacing * M.sign);
+    // lines traveling opposite ways can land on the same slot — fall back to
+    // plain world-frame slots so tracks at least never overlap
+    if (new Set(lat.map((v) => Math.round(v * 8))).size !== lat.length)
+      lat = members.map((_, k) => (k - (members.length - 1) / 2) * spacing);
+    members.forEach((M, k) => {
+      offsets[M.li][M.i] = { x: ux * lat[k], y: uy * lat[k] };
+    });
+  }
+
+  // rendered vertices: intersect the two adjacent offset segments (miter)
+  const geom = new Map();
+  state.lines.forEach((line, li) => {
+    const pts = line.points, n = pts.length, off = offsets[li];
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      const inSeg = line.closed ? (i - 1 + n) % n : i > 0 ? i - 1 : null;
+      const outSeg = line.closed ? i : i < n - 1 ? i : null;
+      if (inSeg == null && outSeg == null) { out.push({ x: p.x, y: p.y }); continue; }
+      if (inSeg == null) { out.push({ x: p.x + off[outSeg].x, y: p.y + off[outSeg].y }); continue; }
+      if (outSeg == null) { out.push({ x: p.x + off[inSeg].x, y: p.y + off[inSeg].y }); continue; }
+      const o1 = off[inSeg], o2 = off[outSeg];
+      if (o1.x === o2.x && o1.y === o2.y) { out.push({ x: p.x + o1.x, y: p.y + o1.y }); continue; }
+      const a = pts[(i - 1 + n) % n], b = pts[(i + 1) % n];
+      const d1 = { x: p.x - a.x, y: p.y - a.y }, d2 = { x: b.x - p.x, y: b.y - p.y };
+      const cross = d1.x * d2.y - d1.y * d2.x;
+      if (Math.abs(cross) < 1e-6) {
+        out.push({ x: p.x + (o1.x + o2.x) / 2, y: p.y + (o1.y + o2.y) / 2 });
+      } else {
+        const ax = a.x + o1.x, ay = a.y + o1.y;
+        const bx = p.x + o2.x, by = p.y + o2.y;
+        const t = ((bx - ax) * d2.y - (by - ay) * d2.x) / cross;
+        out.push({ x: ax + t * d1.x, y: ay + t * d1.y });
+      }
+    }
+    geom.set(line.id, out);
+  });
+  return geom;
+}
+
+// simple polyline path (used for overlays / previews)
+function pathFrom(points, closed) {
+  let d = "";
+  points.forEach((p, i) => { d += (i ? "L" : "M") + fmt(p.x) + " " + fmt(p.y) + " "; });
+  if (closed) d += "Z";
+  return d;
+}
+
+// path with rounded corners; vertices holding stations stay sharp so the
+// station dot sits exactly on the line. rawPts (the unoffset editable points)
+// let corridor tracks compensate their radius so parallel turns stay
+// concentric — the inner track curves tighter, the outer wider.
+function buildPathD(pts, closed, radius, stationAt, rawPts) {
+  const n = pts.length;
+  if (n < 2) return "";
+  if (!radius || n === 2) return pathFrom(pts, closed);
+  const P = (i) => pts[((i % n) + n) % n];
+  const S = (i) => stationAt[((i % n) + n) % n];
+  const radiusAt = (i) => {
+    if (!rawPts) return radius;
+    const raw = rawPts[((i % n) + n) % n];
+    const p = P(i), a = P(i - 1), b = P(i + 1);
+    const l1 = Math.hypot(p.x - a.x, p.y - a.y) || 1, l2 = Math.hypot(b.x - p.x, b.y - p.y) || 1;
+    const u1 = { x: (p.x - a.x) / l1, y: (p.y - a.y) / l1 };
+    const u2 = { x: (b.x - p.x) / l2, y: (b.y - p.y) / l2 };
+    const cx = u2.x - u1.x, cy = u2.y - u1.y;   // bisector toward the turn's center
+    const cl = Math.hypot(cx, cy);
+    if (cl < 0.3) return radius;                 // straight-through / jog: no turn
+    const shift = ((p.x - raw.x) * cx + (p.y - raw.y) * cy) / cl;
+    return Math.max(2, radius - shift);
+  };
+  const d = [];
+  const corner = (i) => {
+    const p = P(i), a = P(i - 1), b = P(i + 1);
+    const r1 = Math.hypot(p.x - a.x, p.y - a.y), r2 = Math.hypot(p.x - b.x, p.y - b.y);
+    const r = Math.min(radiusAt(i), r1 * 0.5, r2 * 0.5);
+    if (S(i) || r < 0.5 || r1 < 0.01 || r2 < 0.01) { d.push("L" + fmt(p.x) + " " + fmt(p.y)); return; }
+    const e1 = { x: p.x + ((a.x - p.x) / r1) * r, y: p.y + ((a.y - p.y) / r1) * r };
+    const e2 = { x: p.x + ((b.x - p.x) / r2) * r, y: p.y + ((b.y - p.y) / r2) * r };
+    d.push("L" + fmt(e1.x) + " " + fmt(e1.y),
+           "Q" + fmt(p.x) + " " + fmt(p.y) + " " + fmt(e2.x) + " " + fmt(e2.y));
+  };
+  if (closed) {
+    const m = { x: (P(0).x + P(1).x) / 2, y: (P(0).y + P(1).y) / 2 };
+    d.push("M" + fmt(m.x) + " " + fmt(m.y));
+    for (let i = 1; i <= n; i++) corner(i);
+    d.push("Z");
+  } else {
+    d.push("M" + fmt(pts[0].x) + " " + fmt(pts[0].y));
+    for (let i = 1; i < n - 1; i++) corner(i);
+    d.push("L" + fmt(pts[n - 1].x) + " " + fmt(pts[n - 1].y));
+  }
+  return d.join(" ");
+}
+
+function stationRadius(line, st) {
+  // normal stations are small white dots fully inset in the line's band
+  return st.type === "major" ? line.width * 0.85 + 4.5 : Math.max(1.6, line.width * 0.34);
+}
+
+function rawBounds() {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const l of state.lines) for (const p of l.points) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  if (!isFinite(minX)) return null;
+  return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
+}
+
+// ---------------------------------------------------------------- scene
+// Build the map itself (lines, stations, labels, legend) into a group.
+// Used by both the editor canvas and the exporter.
+function buildScene(g) {
+  const gLines = el("g"), gLineLabels = el("g"), gStations = el("g"), gLegend = el("g");
+  sceneDefs = el("defs");
+  scenePatterns = new Map();
+  g.append(sceneDefs, gLines, gLineLabels, gStations, gLegend);
+
+  const geom = computeGeometry();
+  geomCache = geom;
+
+  // ---- lines (with per-line texture)
+  for (const line of state.lines) {
+    if (line.points.length < 2) continue;
+    const rp = geom.get(line.id);
+    const stationAt = line.points.map((p) => !!p.station);
+    const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, line.points);
+    drawTexturedPath(gLines, d, line, line.width);
+  }
+
+  // ---- line names at termini
+  if (state.showLineNames) {
+    for (const line of state.lines) {
+      if (line.points.length < 2 || !line.name) continue;
+      const rp = geom.get(line.id);
+      let px, py, ux = 1, uy = 0;
+      if (line.closed) {
+        const p = rp[Math.floor(rp.length / 2)];
+        px = p.x + 14; py = p.y - 14;
+      } else {
+        const a = rp[0], b = rp[1];
+        const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+        ux = (a.x - b.x) / len; uy = (a.y - b.y) / len;
+        px = a.x + ux * 30; py = a.y + uy * 30;
+      }
+      const vertical = Math.abs(uy) > 0.85;
+      const anchor = vertical ? "middle" : ux < -0.3 ? "end" : "start";
+      const lg = el("g", { transform: `translate(${fmt(px)},${fmt(py)})` });
+      if (line.badge) {
+        lg.append(el("circle", { cx: 0, cy: 0, r: 8, fill: line.color }));
+        lg.append(el("text", {
+          x: 0, y: 0, fill: "#fff", "font-size": 9, "font-weight": 700,
+          "text-anchor": "middle", "dominant-baseline": "central",
+          "font-family": "Helvetica, Arial, sans-serif",
+        }, line.badge));
+      }
+      const tx = vertical ? 0 : line.badge ? (anchor === "end" ? -12 : 12) : 0;
+      const ty = vertical && line.badge ? uy * 19 : 0;
+      lg.append(el("text", {
+        x: tx, y: ty, fill: line.color,
+        "font-size": 12, "font-weight": 700,
+        "text-anchor": anchor, "dominant-baseline": "central",
+        "font-family": "Helvetica, Arial, sans-serif",
+        stroke: "#fbfaf5", "stroke-width": 3, "paint-order": "stroke",
+      }, line.name));
+      gLineLabels.append(lg);
+    }
+  }
+
+  // ---- stations
+  // vertices grouped by raw coordinate, for capsule interchange markers
+  const atCoord = new Map(); // "x,y" -> [{line, rp:{x,y}}]
+  state.lines.forEach((line) => {
+    const rp = geom.get(line.id);
+    line.points.forEach((p, i) => {
+      const key = p.x + "," + p.y;
+      if (!atCoord.has(key)) atCoord.set(key, []);
+      atCoord.get(key).push({ line, rp: rp[i] });
+    });
+  });
+
+  const capsuleDone = new Set();
+  state.lines.forEach((line) => {
+    const rp = geom.get(line.id);
+    line.points.forEach((p, i) => {
+      const st = p.station;
+      if (!st) return;
+      const pos = rp[i];
+      const r = stationRadius(line, st);
+      if (st.type === "major") {
+        const key = p.x + "," + p.y;
+        const here = atCoord.get(key);
+        // farthest pair of rendered positions at this map location
+        let A = pos, B = pos, span = 0;
+        for (let a = 0; a < here.length; a++) for (let b = a + 1; b < here.length; b++) {
+          const dd = Math.hypot(here[a].rp.x - here[b].rp.x, here[a].rp.y - here[b].rp.y);
+          if (dd > span) { span = dd; A = here[a].rp; B = here[b].rp; }
+        }
+        if (span > 2) {
+          // capsule spanning the parallel tracks
+          if (!capsuleDone.has(key)) {
+            capsuleDone.add(key);
+            const W = Math.max(...here.map((h) => h.line.width)) + 6;
+            gStations.append(el("path", {
+              d: `M${fmt(A.x)} ${fmt(A.y)} L${fmt(B.x)} ${fmt(B.y)}`,
+              stroke: "#111", "stroke-width": W + 5, "stroke-linecap": "round", fill: "none",
+            }));
+            gStations.append(el("path", {
+              d: `M${fmt(A.x)} ${fmt(A.y)} L${fmt(B.x)} ${fmt(B.y)}`,
+              stroke: "#fff", "stroke-width": W, "stroke-linecap": "round", fill: "none",
+            }));
+          }
+        } else {
+          gStations.append(el("circle", {
+            cx: fmt(pos.x), cy: fmt(pos.y), r, fill: "#fff", stroke: "#111", "stroke-width": 2.6,
+          }));
+        }
+      } else {
+        // hairline stroke in the line color: invisible on a solid band, but keeps
+        // the dot visible on hollow / white-cored textures
+        gStations.append(el("circle", {
+          cx: fmt(pos.x), cy: fmt(pos.y), r, fill: "#fff", stroke: line.color, "stroke-width": 1,
+        }));
+      }
+      // labels clear the band edge, not just the dot
+      if (st.name) gStations.append(buildStationLabel(pos, st, st.type === "major" ? r : Math.max(r, line.width / 2)));
+    });
+  });
+
+  // ---- legend strip beneath the map
+  if (state.showLegend) {
+    const rb = rawBounds();
+    if (rb) buildLegend(gLegend, rb.minX - 40, rb.maxY + 80, rb.w + 80);
+  }
+}
+
+function buildStationLabel(p, st, r) {
+  const dir = DIRS[st.dir] || DIRS.e;
+  const rot = st.rot || 0;
+  const dist = r + 7;
+  const ox = dir[0] * dist, oy = dir[1] * dist;
+  const anchor = dir[0] > 0.3 ? "start" : dir[0] < -0.3 ? "end" : "middle";
+  const g = el("g", { transform: `translate(${fmt(p.x)},${fmt(p.y)}) rotate(${rot})` });
+
+  if (st.type === "major") {
+    const fs = 13, padX = 8, h = 20;
+    const w = measureText(st.name, fs, 700) + padX * 2;
+    let x0 = ox, y0 = oy - h / 2;
+    if (anchor === "end") x0 = ox - w;
+    else if (anchor === "middle") x0 = ox - w / 2;
+    if (dir[1] < -0.3) y0 = oy - h; else if (dir[1] > 0.3) y0 = oy;
+    g.append(el("rect", { x: fmt(x0), y: fmt(y0), width: fmt(w), height: h, rx: 9.5, fill: "#111" }));
+    g.append(el("text", {
+      x: fmt(x0 + w / 2), y: fmt(y0 + h / 2 + 0.5), fill: "#fff",
+      "font-size": fs, "font-weight": 700, "text-anchor": "middle",
+      "dominant-baseline": "central",
+      "font-family": "Helvetica, Arial, sans-serif",
+    }, st.name));
+  } else {
+    g.append(el("text", {
+      x: fmt(ox), y: fmt(oy), fill: "#1c1c1c", "font-size": 11.5, "font-weight": 500,
+      "text-anchor": anchor, "dominant-baseline": "central",
+      "font-family": "Helvetica, Arial, sans-serif",
+      stroke: "#fbfaf5", "stroke-width": 2.5, "paint-order": "stroke",
+    }, st.name));
+  }
+  return g;
+}
+
+// Draws the legend into g at (x,y), wrapping within maxW. Returns its height.
+function buildLegend(g, x, y, maxW) {
+  const items = state.lines.filter((l) => l.name && l.points.length > 1);
+  if (!items.length) return 0;
+  const rowH = 28;
+  g.append(el("line", {
+    x1: fmt(x), y1: fmt(y - 10), x2: fmt(x + maxW), y2: fmt(y - 10),
+    stroke: "#d8d3c3", "stroke-width": 1.5,
+  }));
+  let cx = x, cy = y;
+  for (const line of items) {
+    const badgeW = line.badge ? 21 : 0;
+    const tw = measureText(line.name, 12, 600);
+    const w = 30 + 8 + badgeW + tw + 28;
+    if (cx > x && cx + w > x + maxW) { cx = x; cy += rowH; }
+    const ym = cy + rowH / 2;
+    const d = `M${fmt(cx)} ${fmt(ym)} L${fmt(cx + 30)} ${fmt(ym)}`;
+    drawTexturedPath(g, d, line, 6);
+    let tx = cx + 38;
+    if (line.badge) {
+      g.append(el("circle", { cx: fmt(tx + 8), cy: fmt(ym), r: 8, fill: line.color }));
+      g.append(el("text", {
+        x: fmt(tx + 8), y: fmt(ym), fill: "#fff", "font-size": 9, "font-weight": 700,
+        "text-anchor": "middle", "dominant-baseline": "central",
+        "font-family": "Helvetica, Arial, sans-serif",
+      }, line.badge));
+      tx += badgeW;
+    }
+    g.append(el("text", {
+      x: fmt(tx), y: fmt(ym), fill: "#333", "font-size": 12, "font-weight": 600,
+      "dominant-baseline": "central", "font-family": "Helvetica, Arial, sans-serif",
+    }, line.name));
+    cx += w;
+  }
+  return cy + rowH - y;
+}
+
+function renderScene() {
+  layers.lines.replaceChildren();
+  layers.linelabels.replaceChildren();
+  layers.stations.replaceChildren();
+  buildScene(layers.lines);
+  renderOverlay();
+}
+
+function renderOverlay() {
+  layers.overlay.replaceChildren();
+  const s = state.view.scale;
+  const sel = state.selection;
+  if (sel) {
+    const line = lineById(sel.lineId);
+    if (line && line.points.length) {
+      // thin dashed skeleton along the editable (raw) geometry
+      layers.overlay.append(el("path", {
+        d: pathFrom(line.points, line.closed),
+        fill: "none", stroke: "#4c8dff", "stroke-width": 1.5 / s,
+        "stroke-dasharray": `${6 / s} ${4 / s}`,
+        "pointer-events": "none",
+      }));
+      line.points.forEach((p, i) => {
+        const isSel = sel.pointIndex === i;
+        layers.overlay.append(el("rect", {
+          x: p.x - 4.5 / s, y: p.y - 4.5 / s, width: 9 / s, height: 9 / s,
+          fill: isSel ? "#4c8dff" : "#fff", stroke: "#4c8dff",
+          "stroke-width": 1.6 / s, "pointer-events": "none",
+        }));
+      });
+    }
+  }
+  if (state.tool === "draw" && !drawing) {
+    // rings on open-line endpoints: click one to extend that line
+    for (const line of state.lines) {
+      if (line.closed || line.points.length < 2) continue;
+      const rp = geomCache.get(line.id) || line.points;
+      for (const idx of [0, line.points.length - 1]) {
+        const p = rp[idx];
+        layers.overlay.append(el("circle", {
+          cx: p.x, cy: p.y, r: line.width / 2 + 5 / s,
+          fill: "none", stroke: "#4c8dff", "stroke-width": 1.8 / s,
+          opacity: 0.85, "pointer-events": "none",
+        }));
+      }
+    }
+  }
+  if (drawing) {
+    const line = lineById(drawing.lineId);
+    if (line && line.points.length && drawing.cursor) {
+      const last = line.points[line.points.length - 1];
+      layers.overlay.append(el("line", {
+        x1: last.x, y1: last.y, x2: drawing.cursor.x, y2: drawing.cursor.y,
+        stroke: line.color, "stroke-width": line.width, opacity: 0.45,
+        "stroke-linecap": "round", "pointer-events": "none",
+      }));
+      layers.overlay.append(el("circle", {
+        cx: drawing.cursor.x, cy: drawing.cursor.y, r: 4 / s,
+        fill: "#4c8dff", "pointer-events": "none",
+      }));
+    }
+  }
+}
+
+function applyView() {
+  world.setAttribute("transform",
+    `translate(${state.view.x},${state.view.y}) scale(${state.view.scale})`);
+  gridRect.style.display = state.showGrid ? "" : "none";
+  document.getElementById("status-zoom").textContent =
+    Math.round(state.view.scale * 100) + "%";
+}
+
+function renderAll() {
+  applyView();
+  renderScene();
+  renderLineList();
+  renderProps();
+  updateStatus();
+  autosave();
+}
+
+function updateStatus() {
+  const hint = document.getElementById("status-hint");
+  if (drawing) hint.textContent = "Placing points — click first point to close loop · double-click / Enter to finish · Esc to cancel last";
+  else if (state.tool === "draw") hint.textContent = "Click to start a new line · click a ring on an existing line's endpoint to extend it";
+  else if (state.tool === "station") hint.textContent = "Click anywhere on a line to add a station · click an existing station to edit it";
+  else hint.textContent = "Drag points to move · ⌥-drag or double-click a segment to add a bend · Draw tool extends lines from their endpoints";
+}
+
+// ---------------------------------------------------------------- sidebar
+function renderLineList() {
+  const ul = document.getElementById("line-list");
+  ul.replaceChildren();
+  for (const line of state.lines) {
+    const li = document.createElement("li");
+    if (state.selection && state.selection.lineId === line.id) li.classList.add("selected");
+    const chip = document.createElement("span");
+    if (line.badge) {
+      chip.className = "line-badge";
+      chip.style.background = line.color;
+      chip.textContent = line.badge;
+    } else {
+      chip.className = "line-chip";
+      chip.style.background = line.color;
+    }
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = line.name || "(unnamed line)";
+    const del = document.createElement("button");
+    del.className = "del"; del.textContent = "✕"; del.title = "Delete line";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      snapshot();
+      state.lines = state.lines.filter((l) => l.id !== line.id);
+      if (state.selection?.lineId === line.id) state.selection = null;
+      renderAll();
+    };
+    li.append(chip, name, del);
+    li.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
+    ul.append(li);
+  }
+}
+
+function field(labelText, inputEl) {
+  const d = document.createElement("div");
+  d.className = "field";
+  const lab = document.createElement("label");
+  lab.className = "f"; lab.textContent = labelText;
+  d.append(lab, inputEl);
+  return d;
+}
+function mkInput(type, value, onchange, attrs = {}) {
+  const i = document.createElement("input");
+  i.type = type; i.value = value;
+  Object.assign(i, attrs);
+  let snapped = false; // one undo snapshot per focus session, taken before the first edit
+  const commit = () => {
+    if (!snapped) { snapshot(); snapped = true; }
+    onchange(i); renderScene(); renderLineList(); autosave();
+  };
+  i.addEventListener("focus", () => { snapped = false; });
+  i.addEventListener("input", commit);
+  i.addEventListener("change", commit);
+  return i;
+}
+function mkSelect(options, value, onchange) {
+  const s = document.createElement("select");
+  for (const [v, label] of options) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = label;
+    if (v === value) o.selected = true;
+    s.append(o);
+  }
+  s.addEventListener("change", () => { snapshot(); onchange(s); renderScene(); renderProps(); autosave(); });
+  return s;
+}
+
+function renderProps() {
+  const box = document.getElementById("props");
+  const title = document.getElementById("props-title");
+  box.replaceChildren();
+  const sel = state.selection;
+  const line = sel && lineById(sel.lineId);
+  if (!line) {
+    title.textContent = "Properties";
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.innerHTML = "Select a line, or a station point, to edit it.<br><br>" +
+      "<b>Station tool (S):</b> click anywhere on a line to add a station there; click an existing station to edit it.<br>" +
+      "<b>Draw tool (D):</b> click to place points, click the first point to close a loop, double-click / Enter to finish. " +
+      "Click an endpoint of an existing line (marked with a ring) to extend it. " +
+      "Draw along an existing line to share its corridor — parallel tracks fan out automatically.<br>" +
+      "<b>Select tool (V):</b> drag points to move, ⌥-drag or double-click a segment to add a bend point.";
+    box.append(p);
+    return;
+  }
+
+  if (sel.pointIndex == null) {
+    // ---- line properties
+    title.textContent = "Line";
+    box.append(field("Name", mkInput("text", line.name, (i) => (line.name = i.value))));
+
+    const sw = document.createElement("div");
+    sw.className = "swatches";
+    for (const c of PALETTE) {
+      const b = document.createElement("button");
+      b.className = "swatch" + (line.color.toLowerCase() === c.toLowerCase() ? " sel" : "");
+      b.style.background = c;
+      b.onclick = () => { snapshot(); line.color = c; renderScene(); renderLineList(); renderProps(); autosave(); };
+      sw.append(b);
+    }
+    box.append(field("Color", sw));
+
+    const custom = mkInput("color", line.color, (i) => (line.color = i.value));
+    custom.style.width = "100%"; custom.style.height = "26px";
+    box.append(field("Custom color", custom));
+
+    box.append(field("Texture", mkSelect(LINE_STYLES, lineStyle(line), (s) => (line.style = s.value))));
+
+    const width = mkInput("range", line.width, (i) => (line.width = +i.value), { min: 3, max: 16, step: 1 });
+    box.append(field("Thickness — " + line.width, width));
+    width.addEventListener("input", () => {
+      width.parentElement.querySelector("label").textContent = "Thickness — " + width.value;
+    });
+
+    const corner = mkInput("range", lineCorner(line), (i) => (line.corner = +i.value), { min: 0, max: 40, step: 2 });
+    box.append(field("Corner radius — " + lineCorner(line), corner));
+    corner.addEventListener("input", () => {
+      corner.parentElement.querySelector("label").textContent = "Corner radius — " + corner.value;
+    });
+
+    box.append(field("Badge (number in circle)", mkInput("text", line.badge || "", (i) => (line.badge = i.value.trim()), { maxLength: 3, placeholder: "e.g. 9" })));
+
+    const closed = document.createElement("label");
+    closed.className = "chk";
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = !!line.closed;
+    cb.onchange = () => { snapshot(); line.closed = cb.checked; renderScene(); autosave(); };
+    closed.append(cb, document.createTextNode(" Closed loop"));
+    box.append(field("", closed));
+
+    const dup = document.createElement("button");
+    dup.textContent = "⧉ Duplicate as parallel line"; dup.style.width = "100%"; dup.style.marginBottom = "8px";
+    dup.title = "Copy this line's route — the copy shares the corridor and fans out beside it";
+    dup.onclick = () => {
+      snapshot();
+      const copy = clone(line);
+      copy.id = uid();
+      copy.name = line.name + " (parallel)";
+      copy.badge = "";
+      copy.points.forEach((p) => (p.station = null));
+      const used = new Set(state.lines.map((l) => l.color));
+      copy.color = PALETTE.find((c) => !used.has(c)) || copy.color;
+      state.lines.push(copy);
+      state.selection = { lineId: copy.id };
+      renderAll();
+    };
+    box.append(dup);
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "danger"; delBtn.textContent = "Delete line"; delBtn.style.width = "100%";
+    delBtn.onclick = () => {
+      snapshot();
+      state.lines = state.lines.filter((l) => l.id !== line.id);
+      state.selection = null;
+      renderAll();
+    };
+    box.append(delBtn);
+  } else {
+    // ---- point / station properties
+    const p = line.points[sel.pointIndex];
+    title.textContent = "Point on " + (line.name || "line");
+    const typeSel = mkSelect(
+      [["none", "No station"], ["normal", "Station"], ["major", "Major station (black pill)"]],
+      p.station ? p.station.type : "none",
+      (s) => {
+        if (s.value === "none") p.station = null;
+        else if (!p.station) p.station = { name: "Station", type: s.value, dir: "e", rot: 0 };
+        else p.station.type = s.value;
+      });
+    box.append(field("Station type", typeSel));
+
+    if (p.station) {
+      const st = p.station;
+      const nameIn = mkInput("text", st.name, (i) => (st.name = i.value));
+      box.append(field("Station name", nameIn));
+
+      box.append(field("Label position", mkSelect(
+        [["e", "Right"], ["w", "Left"], ["n", "Above"], ["s", "Below"],
+         ["ne", "Upper right"], ["nw", "Upper left"], ["se", "Lower right"], ["sw", "Lower left"]],
+        st.dir || "e", (s) => (st.dir = s.value))));
+
+      const rot = mkInput("range", st.rot || 0, (i) => (st.rot = +i.value), { min: -90, max: 90, step: 5 });
+      box.append(field("Label angle — " + (st.rot || 0) + "°", rot));
+      rot.addEventListener("input", () => {
+        rot.parentElement.querySelector("label").textContent = "Label angle — " + rot.value + "°";
+      });
+    }
+
+    const row = document.createElement("div");
+    row.className = "btn-row";
+    const delPt = document.createElement("button");
+    delPt.textContent = "Delete point";
+    delPt.onclick = () => {
+      snapshot();
+      line.points.splice(sel.pointIndex, 1);
+      if (line.points.length < 2) state.lines = state.lines.filter((l) => l.id !== line.id);
+      state.selection = { lineId: line.id };
+      validateSelection();
+      renderAll();
+    };
+    const toLine = document.createElement("button");
+    toLine.textContent = "Select line";
+    toLine.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
+    row.append(delPt, toLine);
+    box.append(row);
+  }
+}
+
+// ---------------------------------------------------------------- hit testing
+// Tests against rendered (corridor-offset) geometry so clicks land on the
+// track the user sees; indices map back to the raw editable points.
+function hitTest(w) {
+  const tol = 9 / state.view.scale;
+  const linesOrdered = state.selection
+    ? [lineById(state.selection.lineId), ...state.lines.filter((l) => l.id !== state.selection.lineId)].filter(Boolean)
+    : [...state.lines].reverse();
+  for (const line of linesOrdered) {
+    const rp = geomCache.get(line.id) || line.points;
+    for (let i = 0; i < line.points.length; i++) {
+      const p = rp[i] || line.points[i];
+      const r = line.points[i].station
+        ? stationRadius(line, line.points[i].station) + 4 / state.view.scale : tol;
+      if (Math.hypot(w.x - p.x, w.y - p.y) <= Math.max(r, tol))
+        return { type: "point", line, index: i };
+    }
+  }
+  for (const line of linesOrdered) {
+    const rp = geomCache.get(line.id) || line.points;
+    const n = line.closed ? rp.length : rp.length - 1;
+    for (let i = 0; i < n; i++) {
+      const a = rp[i], b = rp[(i + 1) % rp.length];
+      const res = distToSegment(w, a, b);
+      if (res.d <= Math.max(line.width / 2 + 3 / state.view.scale, tol))
+        return { type: "segment", line, index: i, at: res };
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------- tools & mouse
+let mouse = null; // {mode, startClient, startView, line, index, orig, moved}
+
+function setTool(t) {
+  state.tool = t;
+  if (t !== "draw") finishDrawing();
+  document.getElementById("tool-select").classList.toggle("active", t === "select");
+  document.getElementById("tool-draw").classList.toggle("active", t === "draw");
+  document.getElementById("tool-station").classList.toggle("active", t === "station");
+  svg.classList.toggle("tool-draw", t === "draw" || t === "station");
+  updateStatus();
+  renderOverlay();
+}
+
+function startLine() {
+  snapshot();
+  const used = new Set(state.lines.map((l) => l.color));
+  const color = PALETTE.find((c) => !used.has(c)) || PALETTE[state.lines.length % PALETTE.length];
+  const line = {
+    id: uid(), name: "New Line " + (state.lines.length + 1),
+    color, width: 9, badge: "", style: "solid", corner: 16, closed: false, points: [],
+  };
+  state.lines.push(line);
+  drawing = { lineId: line.id, cursor: null };
+  state.selection = { lineId: line.id };
+  return line;
+}
+
+function drawSnap(line, w) {
+  const pts = line.points;
+  if (pts.length && state.snap45) return snapOcta(pts[pts.length - 1], w);
+  return { x: snap(w.x), y: snap(w.y) };
+}
+
+function finishDrawing() {
+  if (!drawing) return;
+  const line = lineById(drawing.lineId);
+  drawing = null;
+  if (line) {
+    // dedupe consecutive points
+    for (let i = line.points.length - 1; i > 0; i--) {
+      const a = line.points[i], b = line.points[i - 1];
+      if (a.x === b.x && a.y === b.y) line.points.splice(i, 1);
+    }
+    if (line.points.length < 2) {
+      state.lines = state.lines.filter((l) => l.id !== line.id);
+      if (state.selection?.lineId === line.id) state.selection = null;
+    }
+  }
+  renderAll();
+}
+function cancelDrawing(rerender = true) {
+  drawing = null;
+  if (rerender) renderAll();
+}
+
+svg.addEventListener("mousedown", (e) => {
+  if (e.button === 1 || (e.button === 0 && spaceDown)) {
+    mouse = { mode: "pan", startClient: [e.clientX, e.clientY], startView: { ...state.view } };
+    svg.classList.add("panning");
+    e.preventDefault();
+    return;
+  }
+  if (e.button !== 0) return;
+  const w = toWorld(e.clientX, e.clientY);
+
+  if (state.tool === "draw") {
+    let line = drawing ? lineById(drawing.lineId) : null;
+    if (!line) {
+      // clicking an endpoint of an existing open line resumes drawing it
+      const hit = hitTest(w);
+      if (hit && hit.type === "point" && !hit.line.closed && hit.line.points.length > 1 &&
+          (hit.index === 0 || hit.index === hit.line.points.length - 1)) {
+        snapshot();
+        if (hit.index === 0) hit.line.points.reverse();
+        drawing = { lineId: hit.line.id, cursor: null };
+        state.selection = { lineId: hit.line.id };
+        renderAll();
+        return;
+      }
+      line = startLine();
+    }
+    const pt = drawSnap(line, w);
+    // clicking the first point closes the loop
+    if (line.points.length >= 3) {
+      const first = line.points[0];
+      if (Math.hypot(pt.x - first.x, pt.y - first.y) < 15) {
+        line.closed = true;
+        finishDrawing();
+        return;
+      }
+    }
+    const last = line.points[line.points.length - 1];
+    if (!last || last.x !== pt.x || last.y !== pt.y) line.points.push({ ...pt, station: null });
+    renderScene(); renderLineList();
+    return;
+  }
+
+  if (state.tool === "station") {
+    const hit = hitTest(w);
+    if (hit) {
+      snapshot();
+      let index = hit.index;
+      if (hit.type === "segment") {
+        // insert a new point right where the user clicked on the line
+        hit.line.points.splice(hit.index + 1, 0, { x: snap(hit.at.x), y: snap(hit.at.y), station: null });
+        index = hit.index + 1;
+      }
+      const p = hit.line.points[index];
+      if (!p.station) p.station = { name: "New Station", type: "normal", dir: "e", rot: 0 };
+      state.selection = { lineId: hit.line.id, pointIndex: index };
+      renderAll();
+      const nameInput = document.querySelector('#props input[type="text"]');
+      if (nameInput) { nameInput.focus(); nameInput.select(); }
+    }
+    return;
+  }
+
+  // select tool
+  const hit = hitTest(w);
+  if (hit && hit.type === "point") {
+    state.selection = { lineId: hit.line.id, pointIndex: hit.index };
+    mouse = {
+      mode: "movePoint", line: hit.line, index: hit.index,
+      startClient: [e.clientX, e.clientY], orig: { ...hit.line.points[hit.index] }, moved: false,
+    };
+    renderAll();
+  } else if (hit && hit.type === "segment") {
+    if (e.altKey) {
+      // alt-drag a segment: pull out a new bend point right here
+      snapshot();
+      const pt = { x: snap(hit.at.x), y: snap(hit.at.y), station: null };
+      hit.line.points.splice(hit.index + 1, 0, pt);
+      state.selection = { lineId: hit.line.id, pointIndex: hit.index + 1 };
+      mouse = {
+        mode: "movePoint", line: hit.line, index: hit.index + 1,
+        startClient: [e.clientX, e.clientY], orig: { ...pt }, moved: false, snapshotted: true,
+      };
+      renderAll();
+      return;
+    }
+    state.selection = { lineId: hit.line.id };
+    mouse = {
+      mode: "moveLine", line: hit.line,
+      startClient: [e.clientX, e.clientY],
+      orig: clone(hit.line.points), moved: false,
+    };
+    renderAll();
+  } else {
+    mouse = { mode: "panMaybe", startClient: [e.clientX, e.clientY], startView: { ...state.view }, moved: false };
+  }
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (state.tool === "draw" && drawing) {
+    const line = lineById(drawing.lineId);
+    if (line && line.points.length) {
+      drawing.cursor = drawSnap(line, toWorld(e.clientX, e.clientY));
+      renderOverlay();
+    }
+  }
+  if (!mouse) return;
+  const dxc = e.clientX - mouse.startClient[0];
+  const dyc = e.clientY - mouse.startClient[1];
+  if (Math.abs(dxc) + Math.abs(dyc) > 3) mouse.moved = true;
+
+  if (mouse.mode === "pan" || mouse.mode === "panMaybe") {
+    if (mouse.mode === "panMaybe" && !mouse.moved) return;
+    svg.classList.add("panning");
+    state.view.x = mouse.startView.x + dxc;
+    state.view.y = mouse.startView.y + dyc;
+    applyView();
+  } else if (mouse.mode === "movePoint") {
+    if (!mouse.snapshotted && mouse.moved) { snapshot(); mouse.snapshotted = true; }
+    if (!mouse.moved) return;
+    const w = toWorld(e.clientX, e.clientY);
+    const p = mouse.line.points[mouse.index];
+    p.x = snap(w.x); p.y = snap(w.y);
+    renderScene();
+  } else if (mouse.mode === "moveLine") {
+    if (!mouse.snapshotted && mouse.moved) { snapshot(); mouse.snapshotted = true; }
+    if (!mouse.moved) return;
+    const dx = snap(dxc / state.view.scale), dy = snap(dyc / state.view.scale);
+    mouse.line.points.forEach((p, i) => {
+      p.x = mouse.orig[i].x + dx;
+      p.y = mouse.orig[i].y + dy;
+    });
+    renderScene();
+  }
+});
+
+window.addEventListener("mouseup", () => {
+  if (!mouse) return;
+  const wasClickOnEmpty = mouse.mode === "panMaybe" && !mouse.moved;
+  const mutated = (mouse.mode === "movePoint" || mouse.mode === "moveLine") && mouse.moved;
+  svg.classList.remove("panning");
+  mouse = null;
+  if (wasClickOnEmpty && state.selection) {
+    state.selection = null;
+    renderAll();
+  } else if (mutated) {
+    renderAll();
+  }
+});
+
+svg.addEventListener("dblclick", (e) => {
+  const w = toWorld(e.clientX, e.clientY);
+  if (state.tool === "draw") { finishDrawing(); return; }
+  const hit = hitTest(w);
+  if (hit && hit.type === "point") {
+    const p = hit.line.points[hit.index];
+    snapshot();
+    if (!p.station) p.station = { name: "Station", type: "normal", dir: "e", rot: 0 };
+    state.selection = { lineId: hit.line.id, pointIndex: hit.index };
+    renderAll();
+    const nameInput = document.querySelector('#props input[type="text"]');
+    if (nameInput) { nameInput.focus(); nameInput.select(); }
+  } else if (hit && hit.type === "segment") {
+    snapshot();
+    const pt = { x: snap(hit.at.x), y: snap(hit.at.y), station: null };
+    hit.line.points.splice(hit.index + 1, 0, pt);
+    state.selection = { lineId: hit.line.id, pointIndex: hit.index + 1 };
+    renderAll();
+  }
+});
+
+svg.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  if (drawing) finishDrawing();
+});
+
+svg.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  const r = svg.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const s0 = state.view.scale;
+  const s1 = Math.min(4, Math.max(0.15, s0 * factor));
+  state.view.x = mx - ((mx - state.view.x) / s0) * s1;
+  state.view.y = my - ((my - state.view.y) / s0) * s1;
+  state.view.scale = s1;
+  applyView();
+  renderOverlay();
+}, { passive: false });
+
+// ---------------------------------------------------------------- keyboard
+let spaceDown = false;
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeMenus();
+    const modal = document.getElementById("open-modal");
+    if (!modal.classList.contains("hidden")) { modal.classList.add("hidden"); return; }
+  }
+  const inInput = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+  if (e.code === "Space" && !inInput) { spaceDown = true; e.preventDefault(); }
+  if (inInput) {
+    if (e.key === "Escape") document.activeElement.blur();
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+    e.preventDefault();
+    e.shiftKey ? redo() : undo();
+    return;
+  }
+  switch (e.key) {
+    case "v": case "V": setTool("select"); break;
+    case "d": case "D": setTool("draw"); break;
+    case "Enter":
+      if (drawing) finishDrawing();
+      break;
+    case "Escape":
+      if (drawing) {
+        const line = lineById(drawing.lineId);
+        if (line && line.points.length > 1) { line.points.pop(); if (drawing) drawing.cursor = null; renderScene(); }
+        else finishDrawing();
+      } else if (state.selection) { state.selection = null; renderAll(); }
+      break;
+    case "Backspace": case "Delete": {
+      const sel = state.selection;
+      if (!sel) break;
+      const line = lineById(sel.lineId);
+      if (!line) break;
+      snapshot();
+      if (sel.pointIndex != null) {
+        line.points.splice(sel.pointIndex, 1);
+        if (line.points.length < 2) {
+          state.lines = state.lines.filter((l) => l.id !== line.id);
+          state.selection = null;
+        } else state.selection = { lineId: line.id };
+      } else {
+        state.lines = state.lines.filter((l) => l.id !== line.id);
+        state.selection = null;
+      }
+      renderAll();
+      e.preventDefault();
+      break;
+    }
+    case "s": case "S": {
+      const sel = state.selection;
+      if (!sel || sel.pointIndex == null) { setTool("station"); break; }
+      const line = lineById(sel.lineId);
+      const p = line?.points[sel.pointIndex];
+      if (p) {
+        snapshot();
+        if (!p.station) p.station = { name: "Station", type: "normal", dir: "e", rot: 0 };
+        else if (p.station.type === "normal") p.station.type = "major";
+        else p.station = null;
+        renderAll();
+      }
+      break;
+    }
+    case "g": case "G":
+      state.showGrid = !state.showGrid;
+      document.getElementById("opt-grid").checked = state.showGrid;
+      applyView();
+      break;
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space") spaceDown = false;
+});
+
+// ---------------------------------------------------------------- export
+function contentBBox() {
+  const rb = rawBounds();
+  if (!rb) return { x: 0, y: 0, w: 800, h: 600 };
+  const m = 130;
+  const bb = { x: rb.minX - m, y: rb.minY - m, w: rb.w + 2 * m, h: rb.h + 2 * m };
+  if (state.showLegend) {
+    const legH = buildLegend(el("g"), 0, 0, rb.w + 80);
+    if (legH) bb.h = Math.max(bb.h, rb.maxY + 80 + legH + 30 - bb.y);
+  }
+  return bb;
+}
+
+function buildExportSVG() {
+  const bb = contentBBox();
+  const ex = el("svg", {
+    xmlns: "http://www.w3.org/2000/svg",
+    viewBox: `${bb.x} ${bb.y} ${bb.w} ${bb.h}`,
+    width: bb.w, height: bb.h,
+  });
+  ex.append(el("rect", { x: bb.x, y: bb.y, width: bb.w, height: bb.h, fill: "#fbfaf5" }));
+  const g = el("g");
+  ex.append(g);
+  buildScene(g);
+  return { svgEl: ex, bb };
+}
+
+function download(filename, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function exportFileName(ext) {
+  return (currentMapName().replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-").toLowerCase() || "railmap") + "." + ext;
+}
+
+function exportSVGFile() {
+  const { svgEl } = buildExportSVG();
+  const xml = new XMLSerializer().serializeToString(svgEl);
+  download(exportFileName("svg"), new Blob([xml], { type: "image/svg+xml" }));
+  renderScene(); // buildScene refreshed geomCache against export state; re-sync
+}
+
+function exportPNGFile() {
+  const { svgEl, bb } = buildExportSVG();
+  const xml = new XMLSerializer().serializeToString(svgEl);
+  const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml" }));
+  const img = new Image();
+  img.onload = () => {
+    const scale = 2;
+    const c = document.createElement("canvas");
+    c.width = bb.w * scale; c.height = bb.h * scale;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#fbfaf5";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    c.toBlob((blob) => download(exportFileName("png"), blob), "image/png");
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+  renderScene();
+}
+
+function exportJSONFile() {
+  download(exportFileName("json"), new Blob([serialize()], { type: "application/json" }));
+}
+
+// ---------------------------------------------------------------- toolbar wiring
+document.getElementById("tool-select").onclick = () => setTool("select");
+document.getElementById("tool-draw").onclick = () => setTool("draw");
+document.getElementById("tool-station").onclick = () => setTool("station");
+document.getElementById("btn-new-line").onclick = () => { setTool("draw"); };
+document.getElementById("btn-undo").onclick = undo;
+document.getElementById("btn-redo").onclick = redo;
+
+document.getElementById("opt-grid").onchange = (e) => { state.showGrid = e.target.checked; applyView(); };
+document.getElementById("opt-snap45").onchange = (e) => { state.snap45 = e.target.checked; };
+document.getElementById("opt-linenames").onchange = (e) => { state.showLineNames = e.target.checked; renderScene(); };
+document.getElementById("opt-legend").onchange = (e) => { state.showLegend = e.target.checked; renderScene(); };
+
+function zoomBy(f) {
+  const r = svg.getBoundingClientRect();
+  const mx = r.width / 2, my = r.height / 2;
+  const s0 = state.view.scale, s1 = Math.min(4, Math.max(0.15, s0 * f));
+  state.view.x = mx - ((mx - state.view.x) / s0) * s1;
+  state.view.y = my - ((my - state.view.y) / s0) * s1;
+  state.view.scale = s1;
+  applyView(); renderOverlay();
+}
+document.getElementById("btn-zoom-in").onclick = () => zoomBy(1.25);
+document.getElementById("btn-zoom-out").onclick = () => zoomBy(0.8);
+document.getElementById("btn-fit").onclick = fitView;
+
+function fitView() {
+  const bb = contentBBox();
+  const r = svg.getBoundingClientRect();
+  const s = Math.min(4, Math.max(0.15, Math.min(r.width / bb.w, r.height / bb.h)));
+  state.view.scale = s;
+  state.view.x = (r.width - bb.w * s) / 2 - bb.x * s;
+  state.view.y = (r.height - bb.h * s) / 2 - bb.y * s;
+  applyView(); renderOverlay();
+}
+
+// ---------------------------------------------------------------- file menu & open dialog
+function closeMenus() {
+  document.querySelectorAll(".menu").forEach((m) => m.classList.add("hidden"));
+}
+function setupMenu(btnId, menuId, onAct) {
+  const btn = document.getElementById(btnId);
+  const menu = document.getElementById(menuId);
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    const wasOpen = !menu.classList.contains("hidden");
+    closeMenus();
+    if (!wasOpen) menu.classList.remove("hidden");
+  };
+  menu.addEventListener("click", (e) => {
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    if (!act) return;
+    closeMenus();
+    onAct(act);
+  });
+}
+document.addEventListener("click", closeMenus);
+
+function fileAction(act) {
+  switch (act) {
+    case "new": createMap(untitledName(), []); break;
+    case "open": showOpenModal(); break;
+    case "import": document.getElementById("file-input").click(); break;
+    case "json": exportJSONFile(); break;
+    case "svg": exportSVGFile(); break;
+    case "png": exportPNGFile(); break;
+    case "sample": createMap("Sample Map", sampleLines()); break;
+    case "clear":
+      if (!confirm("Delete all lines on this map? (Undo is available)")) return;
+      snapshot();
+      state.lines = [];
+      state.selection = null;
+      cancelDrawing(false);
+      renderAll();
+      break;
+  }
+}
+setupMenu("btn-file", "file-menu", fileAction);
+setupMenu("btn-export", "export-menu", fileAction);
+
+const openModal = document.getElementById("open-modal");
+function showOpenModal() {
+  const ul = document.getElementById("map-list");
+  ul.replaceChildren();
+  const maps = loadStore().maps.sort((a, b) => b.updatedAt - a.updatedAt);
+  for (const m of maps) {
+    const li = document.createElement("li");
+    if (m.id === currentMapId) li.classList.add("current");
+    const info = document.createElement("div");
+    info.className = "minfo";
+    const name = document.createElement("div");
+    name.className = "mname";
+    name.textContent = m.name + (m.id === currentMapId ? "  (current)" : "");
+    const meta = document.createElement("div");
+    meta.className = "mmeta";
+    const stations = m.lines.reduce((n, l) => n + l.points.filter((p) => p.station).length, 0);
+    meta.textContent = `${m.lines.length} line${m.lines.length === 1 ? "" : "s"} · ${stations} station${stations === 1 ? "" : "s"} · edited ${new Date(m.updatedAt).toLocaleString()}`;
+    info.append(name, meta);
+    const del = document.createElement("button");
+    del.className = "mdel"; del.textContent = "✕"; del.title = "Delete map";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete map "${m.name}"? This cannot be undone.`)) return;
+      deleteMap(m.id);
+      showOpenModal();
+    };
+    li.append(info, del);
+    li.onclick = () => { hideOpenModal(); openMap(m.id); };
+    ul.append(li);
+  }
+  openModal.classList.remove("hidden");
+}
+function hideOpenModal() { openModal.classList.add("hidden"); }
+document.getElementById("open-close").onclick = hideOpenModal;
+openModal.addEventListener("click", (e) => { if (e.target === openModal) hideOpenModal(); });
+
+document.getElementById("map-name").addEventListener("input", autosave);
+document.getElementById("map-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") e.target.blur();
+});
+
+document.getElementById("file-input").onchange = (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  f.text().then((txt) => {
+    try {
+      const data = parseMapFile(txt);
+      createMap(data.name || f.name.replace(/\.json$/i, ""), data.lines);
+    } catch (err) {
+      alert("Could not load file: " + err.message);
+    }
+  });
+  e.target.value = "";
+};
+
+// ---------------------------------------------------------------- sample map
+function st(name, type = "normal", dir = "e", rot = 0) {
+  return { name, type, dir, rot };
+}
+function sampleLines() {
+  return [
+    {
+      id: "L1", name: "Loop Line", color: "#2E9A44", width: 9, badge: "1",
+      style: "solid", corner: 18, closed: true,
+      points: [
+        { x: 480, y: 180, station: st("Kitagawa", "normal", "nw", -30) },
+        { x: 600, y: 180, station: st("Northgate", "major", "n", -30) },
+        { x: 720, y: 180, station: st("Higashino", "normal", "ne", -30) },
+        { x: 880, y: 340, station: st("Mint Hill", "normal", "ne", 0) },
+        { x: 880, y: 420, station: st("Eastside", "major", "e", 0) },
+        { x: 880, y: 500, station: st("Tannery", "normal", "e", 0) },
+        { x: 720, y: 660, station: st("Kaede", "normal", "se", 30) },
+        { x: 600, y: 660, station: st("Southport", "major", "s", 30) },
+        { x: 480, y: 660, station: st("Willow", "normal", "sw", 30) },
+        { x: 320, y: 500, station: st("Aoba", "normal", "w", 0) },
+        { x: 320, y: 420, station: st("West Park", "major", "w", 0) },
+        { x: 320, y: 340, station: st("Foundry", "normal", "w", 0) },
+      ],
+    },
+    {
+      id: "L2", name: "Crosstown Line", color: "#F15A22", width: 9, badge: "2",
+      style: "solid", corner: 16, closed: false,
+      points: [
+        { x: 80, y: 420, station: st("Milldale", "normal", "n", -45) },
+        { x: 200, y: 420, station: st("Brickfields", "normal", "n", -45) },
+        { x: 320, y: 420, station: null },
+        { x: 460, y: 420, station: st("Old Town", "normal", "n", -45) },
+        { x: 600, y: 420, station: st("Central", "major", "s", 0) },
+        { x: 740, y: 420, station: st("Riverside", "normal", "n", -45) },
+        { x: 880, y: 420, station: null },
+        { x: 1000, y: 420, station: st("Harbor East", "normal", "n", -45) },
+        { x: 1120, y: 420, station: null },
+        { x: 1200, y: 340, station: st("Airport ✈", "major", "e", 0) },
+      ],
+    },
+    {
+      id: "L3", name: "Northern Line", color: "#E6002D", width: 9, badge: "3",
+      style: "solid", corner: 16, closed: false,
+      points: [
+        { x: 600, y: 40, station: st("Hilltop", "normal", "e", 0) },
+        { x: 600, y: 120, station: st("Observatory", "normal", "e", 0) },
+        { x: 600, y: 180, station: null },
+        { x: 600, y: 300, station: st("Museum", "normal", "e", 0) },
+        { x: 600, y: 420, station: null },
+        { x: 600, y: 540, station: st("Market", "normal", "e", 0) },
+        { x: 600, y: 660, station: null },
+        { x: 600, y: 780, station: st("Ferry Quay", "normal", "e", 0) },
+        { x: 600, y: 860, station: st("South Pier", "major", "s", 0) },
+      ],
+    },
+    {
+      id: "L4", name: "Sakura Shinkansen", color: "#7B1FA2", width: 10, badge: "4",
+      style: "stripe", corner: 20, closed: false,
+      points: [
+        { x: 280, y: 100, station: st("Highlands", "major", "e", 0) },
+        { x: 440, y: 260, station: st("Sakura Park", "normal", "nw", 0) },
+        { x: 600, y: 420, station: null },
+        { x: 760, y: 580, station: st("Stadium", "normal", "se", 0) },
+        { x: 920, y: 740, station: st("Seaview", "major", "e", 0) },
+      ],
+    },
+    {
+      id: "L5", name: "Yellow Local", color: "#EFC800", width: 9, badge: "5",
+      style: "solid", corner: 16, closed: false,
+      points: [
+        { x: 160, y: 180, station: st("Lakeside", "normal", "s", 0) },
+        { x: 300, y: 180, station: st("Foxhill", "normal", "n", -45) },
+        { x: 480, y: 180, station: null },
+        { x: 600, y: 180, station: null },
+        { x: 720, y: 180, station: null },
+        { x: 860, y: 180, station: st("Orchard", "normal", "n", -45) },
+        { x: 1040, y: 180, station: st("Easton", "normal", "e", 0) },
+      ],
+    },
+    {
+      id: "L6", name: "Bay Monorail", color: "#0072BC", width: 9, badge: "6",
+      style: "hollow", corner: 16, closed: false,
+      points: [
+        { x: 160, y: 740, station: st("Westhaven", "normal", "s", 0) },
+        { x: 360, y: 740, station: st("Dockyards", "normal", "s", 0) },
+        { x: 520, y: 740, station: st("Cannery Row", "normal", "s", 0) },
+        { x: 600, y: 660, station: null },
+      ],
+    },
+  ];
+}
+
+// ---------------------------------------------------------------- boot
+(function boot() {
+  const s = loadStore();
+  if (!s.maps.length) {
+    // migrate the old single-slot save, if any
+    try {
+      const legacy = JSON.parse(localStorage.getItem(LEGACY_KEY));
+      if (legacy && Array.isArray(legacy.lines) && legacy.lines.length) {
+        s.maps.push({ id: "M-legacy", name: "My Map", updatedAt: Date.now(), lines: legacy.lines });
+        localStorage.removeItem(LEGACY_KEY);
+      }
+    } catch (e) { /* ignore corrupted legacy save */ }
+  }
+  if (!s.maps.length)
+    s.maps.push({ id: "M-sample", name: "Sample Map", updatedAt: Date.now(), lines: sampleLines() });
+  saveStore(s);
+  let cur = null;
+  try { cur = localStorage.getItem(CUR_KEY); } catch (e) { /* ignore */ }
+  const m = s.maps.find((x) => x.id === cur) || [...s.maps].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  currentMapId = m.id;
+  document.getElementById("map-name").value = m.name;
+  setLines(clone(m.lines));
+  setTool("select");
+  renderAll();
+  requestAnimationFrame(fitView);
+})();
