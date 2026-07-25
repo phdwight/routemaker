@@ -55,7 +55,7 @@ const UI_KEY = "routemaker.ui.v1";
 const PAPER_STOCKS = ["#faf7ef", "#ffffff", "#f2efe6", "#e8e4d8"];
 const TOOL_META = {
   select:  { name: "Select",  hint: "Drag a point to move it · ⌥-drag or double-click a segment to add a bend" },
-  draw:    { name: "Draw",    hint: "Click to place points · click the first point to close a loop · double-click to finish" },
+  draw:    { name: "Draw",    hint: "Tap to place points · tap the last point (or ✓ Finish) to stop · tap the first point to close a loop" },
   station: { name: "Station", hint: "Click anywhere on a line to add a station · click a station to edit it" },
   label:   { name: "Label",   hint: "Click a station to rename it and edit its label position / angle" },
   guides:  { name: "Guides",  hint: "Drag out of a ruler to add a guide · drop it back on the ruler to remove it" },
@@ -1007,7 +1007,7 @@ function stationCount() {
 function updateStatus() {
   // options-bar contextual hint
   let hint = (TOOL_META[state.tool] || TOOL_META.select).hint;
-  if (drawing) hint = "Placing points · click the first point to close a loop · double-click / Enter to finish · Esc undoes last";
+  if (drawing) hint = "Placing points · tap the last point or ✓ Finish to stop · tap the first point to close a loop · Esc undoes last";
   setText("ob-hint", hint);
 
   // status bar readouts
@@ -1284,7 +1284,7 @@ function renderProps() {
   if (!line) {
     const e = elh("div", "insp-empty");
     e.innerHTML = "Select a line, or a station point, to edit it.<br><br>" +
-      "<b>Draw (D)</b> places points — click the first point to close a loop.<br>" +
+      "<b>Draw (D)</b> places points — tap the last point (or the ✓ Finish button) to stop, or the first point to close a loop.<br>" +
       "<b>Station (S)</b> adds a stop anywhere on a line.<br>" +
       "<b>Select (V)</b> drags points; ⌥-drag or double-click a segment to add a bend.";
     box.append(e);
@@ -1689,11 +1689,20 @@ function onPointerDown(e) {
       line = startLine();
     }
     const pt = drawSnap(line, w);
-    // clicking the first point closes the loop
+    // tapping the first point closes the loop
     if (line.points.length >= 3) {
       const first = line.points[0];
       if (Math.hypot(pt.x - first.x, pt.y - first.y) < 15) {
         line.closed = true;
+        finishDrawing();
+        return;
+      }
+    }
+    // tapping the last point (the tip you just placed) finishes an open line —
+    // the Pencil-friendly "stop drawing" gesture (no right-click on the web).
+    if (line.points.length >= 2) {
+      const lastP = line.points[line.points.length - 1];
+      if (Math.hypot(pt.x - lastP.x, pt.y - lastP.y) < 14 / state.view.scale) {
         finishDrawing();
         return;
       }
