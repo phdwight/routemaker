@@ -23,6 +23,11 @@ const LINE_STYLES = [
   ["edged", "Edged (dark outline)"],
   ["hatch", "Diagonal hatch"],
   ["zigzag", "Zigzag"],
+  ["wave", "Wave"],
+  ["chevron", "Chevron"],
+  ["crosshatch", "Cross-hatch"],
+  ["rail", "Rail ties"],
+  ["dashdot", "Dash-dot"],
 ];
 const CORRIDOR_GAP = 1;   // hairline seam between parallel lines sharing a corridor
 const MAPS_KEY = "routemaker.maps.v1";
@@ -152,17 +157,35 @@ function ensurePattern(kind, color) {
   const key = kind + color;
   if (scenePatterns.has(key)) return scenePatterns.get(key);
   const id = "pat-" + kind + "-" + color.replace(/[^0-9a-zA-Z]/g, "");
+  const W = "rgba(255,255,255,0.85)";
+  const mk = (attrs) => el("pattern", Object.assign({ id, patternUnits: "userSpaceOnUse" }, attrs));
   let pat;
   if (kind === "hatch") {
-    pat = el("pattern", { id, width: 7, height: 7, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" });
+    pat = mk({ width: 7, height: 7, patternTransform: "rotate(45)" });
     pat.append(el("rect", { width: 7, height: 7, fill: color }));
     pat.append(el("rect", { width: 7, height: 1.8, fill: "rgba(255,255,255,0.75)" }));
+  } else if (kind === "crosshatch") {
+    pat = mk({ width: 8, height: 8 });
+    pat.append(el("rect", { width: 8, height: 8, fill: color }));
+    pat.append(el("path", { d: "M0 0 L8 8 M8 0 L0 8", fill: "none", stroke: W, "stroke-width": 1.2 }));
+  } else if (kind === "wave") {
+    pat = mk({ width: 16, height: 12 });
+    pat.append(el("rect", { width: 16, height: 12, fill: color }));
+    pat.append(el("path", { d: "M0 6 Q4 0 8 6 T16 6", fill: "none", stroke: W, "stroke-width": 1.5, "stroke-linecap": "round" }));
+  } else if (kind === "chevron") {
+    pat = mk({ width: 10, height: 10 });
+    pat.append(el("rect", { width: 10, height: 10, fill: color }));
+    pat.append(el("path", { d: "M0 8.5 L5 3.5 L10 8.5", fill: "none", stroke: W, "stroke-width": 1.5, "stroke-linejoin": "round" }));
+  } else if (kind === "rail") {
+    pat = mk({ width: 8, height: 10 });
+    pat.append(el("rect", { width: 8, height: 10, fill: color }));
+    pat.append(el("rect", { x: 0, width: 2.4, height: 10, fill: W }));
   } else { // zigzag
-    pat = el("pattern", { id, width: 12, height: 12, patternUnits: "userSpaceOnUse" });
+    pat = mk({ width: 12, height: 12 });
     pat.append(el("rect", { width: 12, height: 12, fill: color }));
     pat.append(el("path", {
       d: "M0 8.5 L3 4.5 L6 8.5 L9 4.5 L12 8.5", fill: "none",
-      stroke: "rgba(255,255,255,0.85)", "stroke-width": 1.4,
+      stroke: W, "stroke-width": 1.4,
     }));
   }
   sceneDefs.append(pat);
@@ -184,7 +207,14 @@ function drawTexturedPath(g, d, line, w) {
       break;
     case "hatch":
     case "zigzag":
+    case "wave":
+    case "chevron":
+    case "crosshatch":
+    case "rail":
       push({ stroke: `url(#${ensurePattern(style, color)})`, "stroke-width": w });
+      break;
+    case "dashdot":
+      push({ stroke: color, "stroke-width": w, "stroke-dasharray": `${w * 2.2} ${w} 0.1 ${w}`, "stroke-linecap": "round" });
       break;
     case "edged":
       push({ stroke: darken(color), "stroke-width": w + 3.5 });
