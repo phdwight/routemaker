@@ -177,6 +177,9 @@ button { font-family: inherit; }
   width: 22px; height: 20px; border-radius: 3px; border: 1px solid #0f0f0f;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2); margin-left: 5px; background: #888;
 }
+.ob-shapes { display: flex; align-items: center; gap: 6px; }
+.ob-shapes.hidden { display: none; }
+.ob-shapes .seg { width: 130px; }
 .ob-spacer { flex: 1; }
 .ob-hint {
   font-size: 10.5px; color: #7c7c7c; text-align: right;
@@ -335,6 +338,7 @@ button { font-family: inherit; }
   box-shadow: inset 0 1px 1px rgba(0, 0, 0, .45); outline: none;
 }
 .insp-name:focus { border-color: var(--acc); }
+.insp-name-static { flex: 1; font-size: 11.5px; font-weight: 600; color: #ededed; }
 .ihd-lab { font-size: 10.5px; color: var(--t-row); width: 34px; flex: none; }
 .insp-type {
   flex: 1; height: 22px; border-radius: 3px; font-size: 10.5px; color: #d8d8d8;

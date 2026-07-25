@@ -42,8 +42,10 @@ let state = {
   view: { x: 40, y: 20, scale: 1 },
   showGrid: true, snap45: true, showLineNames: true, showLegend: true,
   snapAngle: "45", gridSize: GRID, gridContrast: 55, guides: [],
+  features: [], featureKind: "water",
 };
 let drawing = null;    // {lineId} while draw tool is placing points
+let featureDraft = null; // {kind, points:[]} while the Shapes tool is outlining an area
 let nextId = 1;
 const undoStack = [], redoStack = [];
 let geomCache = new Map(); // lineId -> rendered (corridor-offset) points
@@ -58,13 +60,14 @@ const TOOL_META = {
   label:   { name: "Label",   hint: "Click a station to rename it and edit its label position / angle" },
   guides:  { name: "Guides",  hint: "Drag out of a ruler to add a guide · drop it back on the ruler to remove it" },
   zoom:    { name: "Zoom",    hint: "Click to zoom in · ⌥-click to zoom out · double-click to fit" },
+  shapes:  { name: "Shapes",  hint: "Click to outline an area · click the first point or double-click to finish · pick Water / Park" },
 };
 const ACCENTS = { blue: "#4d8fd6", amber: "#c9902a", teal: "#3f8b95", rose: "#b8556f" };
 let ui = {
   showNav: true,
   paper: PAPER_STOCKS[0],
   accent: ACCENTS.blue,
-  openSections: { station: true, stroke: true, stations: true, labels: true, geometry: false, document: false, history: false },
+  openSections: { feature: true, station: true, stroke: true, stations: true, labels: true, geometry: false, document: false, history: false },
 };
 function loadUI() {
   try {
@@ -77,10 +80,15 @@ function saveUI() { try { localStorage.setItem(UI_KEY, JSON.stringify(ui)); } ca
 const svg = document.getElementById("canvas");
 const world = document.getElementById("world");
 const layers = {
+  features: document.getElementById("layer-features"),
   lines: document.getElementById("layer-lines"),
   linelabels: document.getElementById("layer-linelabels"),
   stations: document.getElementById("layer-stations"),
   overlay: document.getElementById("layer-overlay"),
+};
+const FEATURE_STYLES = {
+  water: { fill: "#cfe3f2", stroke: "#a9cbe6", label: "Water" },
+  park:  { fill: "#d9ead0", stroke: "#bcd8ae", label: "Park" },
 };
 const gridRect = document.getElementById("grid-rect");
 const measureCtx = document.createElement("canvas").getContext("2d");
@@ -160,6 +168,33 @@ function dirFromVec(dx, dy) {
   const idx = Math.round(((ang + 360) % 360) / 45) % 8;
   return ["e", "se", "s", "sw", "w", "nw", "n", "ne"][idx];
 }
+
+// ---- background features (water / parks)
+function finishFeature() {
+  if (featureDraft && featureDraft.points.length >= 3) {
+    snapshot("Add " + (FEATURE_STYLES[featureDraft.kind] || {}).label);
+    const f = { id: "F" + (nextId++), kind: featureDraft.kind, points: featureDraft.points.map((p) => ({ x: p.x, y: p.y })) };
+    state.features.push(f);
+    state.selection = { featureId: f.id };
+  }
+  featureDraft = null;
+  renderAll();
+}
+function pointInPoly(p, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
+    if (((yi > p.y) !== (yj > p.y)) && (p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function featureAt(w) {
+  for (let i = state.features.length - 1; i >= 0; i--) {
+    if (pointInPoly(w, state.features[i].points)) return state.features[i];
+  }
+  return null;
+}
+function featureById(id) { return state.features.find((f) => f.id === id); }
 
 function distToSegment(p, a, b) {
   const vx = b.x - a.x, vy = b.y - a.y;
@@ -348,15 +383,16 @@ function drawTexturedPath(g, d, line, w, rp, closed) {
 
 // ---------------------------------------------------------------- undo/redo
 function snapshot(label = "Edit") {
-  undoStack.push({ lines: clone(state.lines), label });
+  undoStack.push({ lines: clone(state.lines), features: clone(state.features), label });
   if (undoStack.length > 100) undoStack.shift();
   redoStack.length = 0;
 }
 function undo() {
   if (!undoStack.length) return;
   const cur = undoStack.pop();
-  redoStack.push({ lines: clone(state.lines), label: cur.label });
+  redoStack.push({ lines: clone(state.lines), features: clone(state.features), label: cur.label });
   state.lines = cur.lines;
+  state.features = cur.features || [];
   cancelDrawing(false);
   validateSelection();
   renderAll();
@@ -364,8 +400,9 @@ function undo() {
 function redo() {
   if (!redoStack.length) return;
   const nxt = redoStack.pop();
-  undoStack.push({ lines: clone(state.lines), label: nxt.label });
+  undoStack.push({ lines: clone(state.lines), features: clone(state.features), label: nxt.label });
   state.lines = nxt.lines;
+  state.features = nxt.features || [];
   validateSelection();
   renderAll();
 }
@@ -396,20 +433,22 @@ function currentMapName() {
   return document.getElementById("map-name").value.trim() || "Untitled Map";
 }
 function serialize() {
-  return JSON.stringify({ app: "routemaker", version: 1, name: currentMapName(), lines: state.lines }, null, 2);
+  return JSON.stringify({ app: "routemaker", version: 1, name: currentMapName(), lines: state.lines, features: state.features }, null, 2);
 }
 function autosave() {
   const s = loadStore();
   const m = s.maps.find((x) => x.id === currentMapId);
   if (!m) return;
   m.lines = state.lines;
+  m.features = state.features;
   m.name = currentMapName();
   m.updatedAt = Date.now();
   saveStore(s);
 }
 function clearHistory() { undoStack.length = 0; redoStack.length = 0; }
-function setLines(lines) {
+function setLines(lines, features) {
   state.lines = lines;
+  state.features = clone(features || []);
   let maxN = 0;
   for (const l of state.lines) {
     const m = /^L(\d+)$/.exec(l.id);
@@ -418,17 +457,18 @@ function setLines(lines) {
   nextId = maxN + 1;
   state.selection = null;
   cancelDrawing(false);
+  featureDraft = null;
   clearHistory();
 }
-function createMap(name, lines) {
+function createMap(name, lines, features) {
   const s = loadStore();
   const id = "M" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  s.maps.push({ id, name, updatedAt: Date.now(), lines: clone(lines) });
+  s.maps.push({ id, name, updatedAt: Date.now(), lines: clone(lines), features: clone(features || []) });
   saveStore(s);
   currentMapId = id;
   try { localStorage.setItem(CUR_KEY, id); } catch (e) { /* ignore */ }
   document.getElementById("map-name").value = name;
-  setLines(clone(lines));
+  setLines(clone(lines), features);
   renderAll();
   fitView();
 }
@@ -439,7 +479,7 @@ function openMap(id) {
   currentMapId = id;
   try { localStorage.setItem(CUR_KEY, id); } catch (e) { /* ignore */ }
   document.getElementById("map-name").value = m.name;
-  setLines(clone(m.lines));
+  setLines(clone(m.lines), m.features);
   renderAll();
   fitView();
 }
@@ -619,10 +659,18 @@ function rawBounds() {
 // Build the map itself (lines, stations, labels, legend) into a group.
 // Used by both the editor canvas and the exporter.
 function buildScene(g) {
-  const gLines = el("g"), gLineLabels = el("g"), gStations = el("g"), gLegend = el("g");
+  const gFeatures = el("g"), gLines = el("g"), gLineLabels = el("g"), gStations = el("g"), gLegend = el("g");
   sceneDefs = el("defs");
   scenePatterns = new Map();
-  g.append(sceneDefs, gLines, gLineLabels, gStations, gLegend);
+  g.append(sceneDefs, gFeatures, gLines, gLineLabels, gStations, gLegend);
+
+  // ---- background features (water / parks) behind the network
+  for (const f of state.features) {
+    if (!f.points || f.points.length < 3) continue;
+    const fs = FEATURE_STYLES[f.kind] || FEATURE_STYLES.water;
+    const d = "M" + f.points.map((p) => fmt(p.x) + " " + fmt(p.y)).join(" L") + " Z";
+    gFeatures.append(el("path", { d, fill: fs.fill, stroke: fs.stroke, "stroke-width": 2, "stroke-linejoin": "round" }));
+  }
 
   const geom = computeGeometry();
   geomCache = geom;
@@ -912,6 +960,22 @@ function renderOverlay() {
       : { x1: gd.pos, y1: -100000, x2: gd.pos, y2: 100000 };
     layers.overlay.append(el("line", { ...a, stroke: "#12a5c0", "stroke-width": gw, opacity: 0.85, "pointer-events": "none" }));
   }
+  if (featureDraft && featureDraft.points.length) {
+    const fs = FEATURE_STYLES[featureDraft.kind] || FEATURE_STYLES.water;
+    layers.overlay.append(el("path", {
+      d: "M" + featureDraft.points.map((p) => fmt(p.x) + " " + fmt(p.y)).join(" L"),
+      fill: "none", stroke: fs.stroke, "stroke-width": 2 / s, "stroke-dasharray": `${5 / s} ${4 / s}`, "pointer-events": "none",
+    }));
+    for (const p of featureDraft.points)
+      layers.overlay.append(el("rect", { x: p.x - 3 / s, y: p.y - 3 / s, width: 6 / s, height: 6 / s, fill: fs.stroke, "pointer-events": "none" }));
+  }
+  if (state.selection && state.selection.featureId) {
+    const f = featureById(state.selection.featureId);
+    if (f) layers.overlay.append(el("path", {
+      d: "M" + f.points.map((p) => fmt(p.x) + " " + fmt(p.y)).join(" L") + " Z",
+      fill: "none", stroke: "#4c8dff", "stroke-width": 2 / s, "stroke-dasharray": `${6 / s} ${4 / s}`, "pointer-events": "none",
+    }));
+  }
   if (typeof syncCanvasControls === "function") syncCanvasControls();
 }
 
@@ -1184,6 +1248,10 @@ function renderProps() {
   if (!hd || !box) return;
   hd.replaceChildren(); box.replaceChildren();
   const sel = state.selection;
+  if (sel && sel.featureId) {
+    const f = featureById(sel.featureId);
+    if (f) { buildFeatureInspector(hd, box, f); return; }
+  }
   const line = sel && lineById(sel.lineId);
 
   if (!line) {
@@ -1347,6 +1415,21 @@ function buildStationSection(line, idx) {
     dz.append(del); body.append(dz);
   });
 }
+function buildFeatureInspector(hd, box, f) {
+  const fs = FEATURE_STYLES[f.kind] || FEATURE_STYLES.water;
+  const r1 = elh("div", "ihd-row");
+  const chip = elh("div", "insp-color"); chip.style.background = fs.fill; chip.style.borderColor = fs.stroke;
+  r1.append(chip, elh("div", "insp-name-static", (fs.label || "Area") + " feature"));
+  hd.append(r1);
+  box.append(section("feature", "Feature", fs.label, (body) => {
+    body.append(propSelect("Kind", [["water", "Water"], ["park", "Park"]], f.kind, (v) => commitPick(() => (f.kind = v))));
+    body.append(elh("div", "hist-item", f.points.length + " points · behind the network"));
+    const dz = elh("div", "sec-danger");
+    const del = elh("button", null, "Delete feature");
+    del.onclick = () => { snapshot("Delete feature"); state.features = state.features.filter((x) => x.id !== f.id); state.selection = null; renderAll(); };
+    dz.append(del); body.append(dz);
+  }));
+}
 function applyPaper() {
   const c = document.getElementById("canvas");
   if (c) c.style.background = ui.paper;
@@ -1416,14 +1499,17 @@ function hitTest(w) {
 let mouse = null; // {mode, startClient, startView, line, index, orig, moved}
 
 function setTool(t) {
-  if (!TOOL_META[t]) return; // ignore inert tools (label/guides/zoom)
+  if (!TOOL_META[t]) return;
   state.tool = t;
   if (t !== "draw") finishDrawing();
-  const ids = { select: "tool-select", draw: "tool-draw", station: "tool-station", label: "tool-label", guides: "tool-guides", zoom: "tool-zoom" };
+  if (t !== "shapes" && featureDraft) { featureDraft = null; }
+  const ids = { select: "tool-select", draw: "tool-draw", station: "tool-station", label: "tool-label", guides: "tool-guides", zoom: "tool-zoom", shapes: "tool-shapes" };
   for (const [tool, id] of Object.entries(ids)) {
     const b = document.getElementById(id); if (b) b.classList.toggle("active", t === tool);
   }
-  svg.classList.toggle("tool-draw", t === "draw" || t === "station" || t === "label" || t === "zoom");
+  const shapesBar = document.getElementById("ob-shapes");
+  if (shapesBar) shapesBar.classList.toggle("hidden", t !== "shapes");
+  svg.classList.toggle("tool-draw", t === "draw" || t === "station" || t === "label" || t === "zoom" || t === "shapes");
   // options-bar tool glyph mirrors the active rail button; name from metadata
   const railBtn = document.getElementById(ids[t]);
   const glyph = document.getElementById("ob-tool-glyph");
@@ -1533,6 +1619,18 @@ function onPointerDown(e) {
     zoomAt(e.clientX, e.clientY, e.altKey ? 1 / 1.35 : 1.35);
     return;
   }
+  if (state.tool === "shapes") {
+    const pt = { x: snap(w.x), y: snap(w.y) };
+    if (!featureDraft) featureDraft = { kind: state.featureKind, points: [], cursor: null };
+    if (featureDraft.points.length >= 3) {
+      const f0 = featureDraft.points[0];
+      if (Math.hypot(pt.x - f0.x, pt.y - f0.y) < 12 / state.view.scale) { finishFeature(); return; }
+    }
+    const last = featureDraft.points[featureDraft.points.length - 1];
+    if (!last || last.x !== pt.x || last.y !== pt.y) featureDraft.points.push(pt);
+    renderOverlay();
+    return;
+  }
   if (state.tool === "label") {
     const hit = hitTest(w);
     if (hit && hit.type === "point" && hit.line.points[hit.index].station) {
@@ -1638,6 +1736,8 @@ function onPointerDown(e) {
     };
     renderAll();
   } else {
+    const f = featureAt(w);
+    if (f) { state.selection = { featureId: f.id }; renderAll(); return; }
     mouse = { mode: "panMaybe", startClient: [e.clientX, e.clientY], startView: { ...state.view }, moved: false };
   }
 }
@@ -1736,6 +1836,7 @@ function activateDouble(clientX, clientY) {
   lastDoubleAt = performance.now();
   const w = toWorld(clientX, clientY);
   if (state.tool === "draw") { finishDrawing(); return; }
+  if (state.tool === "shapes") { finishFeature(); return; }
   if (state.tool === "zoom") { fitView(); return; }
   const hit = hitTest(w);
   if (hit && hit.type === "point") {
@@ -1822,6 +1923,7 @@ window.addEventListener("keydown", (e) => {
     case "d": case "D": setTool("draw"); break;
     case "t": case "T": setTool("label"); break;
     case "z": case "Z": setTool("zoom"); break;
+    case "h": case "H": setTool("shapes"); break;
     case "ArrowUp": case "ArrowDown": case "ArrowLeft": case "ArrowRight": {
       const sel = state.selection;
       const line = sel && lineById(sel.lineId);
@@ -1839,17 +1941,28 @@ window.addEventListener("keydown", (e) => {
     case "?": showShortcuts(); break;
     case "Enter":
       if (drawing) finishDrawing();
+      else if (featureDraft) finishFeature();
       break;
     case "Escape":
       if (drawing) {
         const line = lineById(drawing.lineId);
         if (line && line.points.length > 1) { line.points.pop(); if (drawing) drawing.cursor = null; renderScene(); }
         else finishDrawing();
+      } else if (featureDraft) {
+        featureDraft.points.pop();
+        if (!featureDraft.points.length) featureDraft = null;
+        renderOverlay();
       } else if (state.selection) { state.selection = null; renderAll(); }
       break;
     case "Backspace": case "Delete": {
       const sel = state.selection;
       if (!sel) break;
+      if (sel.featureId) {
+        snapshot("Delete feature");
+        state.features = state.features.filter((f) => f.id !== sel.featureId);
+        state.selection = null;
+        renderAll(); e.preventDefault(); break;
+      }
       const line = lineById(sel.lineId);
       if (!line) break;
       snapshot();
@@ -1965,6 +2078,14 @@ document.getElementById("tool-station").onclick = () => setTool("station");
 document.getElementById("tool-label").onclick = () => setTool("label");
 document.getElementById("tool-guides").onclick = () => setTool("guides");
 document.getElementById("tool-zoom").onclick = () => setTool("zoom");
+document.getElementById("tool-shapes").onclick = () => setTool("shapes");
+document.querySelectorAll("#ob-feature-kind .seg-btn").forEach((b) => {
+  b.onclick = () => {
+    state.featureKind = b.dataset.kind;
+    document.querySelectorAll("#ob-feature-kind .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+    if (featureDraft) { featureDraft.kind = state.featureKind; renderOverlay(); }
+  };
+});
 document.getElementById("btn-undo").onclick = undo;
 document.getElementById("btn-redo").onclick = redo;
 
@@ -2212,7 +2333,7 @@ document.getElementById("file-input").onchange = (e) => {
   f.text().then((txt) => {
     try {
       const data = parseMapFile(txt);
-      createMap(data.name || f.name.replace(/\.json$/i, ""), data.lines);
+      createMap(data.name || f.name.replace(/\.json$/i, ""), data.lines, data.features);
     } catch (err) {
       alert("Could not load file: " + err.message);
     }
@@ -2337,7 +2458,7 @@ function sampleLines() {
   const m = s.maps.find((x) => x.id === cur) || [...s.maps].sort((a, b) => b.updatedAt - a.updatedAt)[0];
   currentMapId = m.id;
   document.getElementById("map-name").value = m.name;
-  setLines(clone(m.lines));
+  setLines(clone(m.lines), m.features);
   setTool("select");
   renderAll();
   requestAnimationFrame(fitView);

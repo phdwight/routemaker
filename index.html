@@ -129,6 +129,13 @@
       <span id="ob-corner" class="ob-field">—</span>
       <span id="ob-color" class="ob-color-chip"></span>
     </div>
+    <div id="ob-shapes" class="ob-shapes hidden">
+      <span class="ob-qlab">Feature</span>
+      <div class="seg" id="ob-feature-kind">
+        <button class="seg-btn active" data-kind="water">Water</button>
+        <button class="seg-btn" data-kind="park">Park</button>
+      </div>
+    </div>
     <div class="ob-spacer"></div>
     <div id="ob-hint" class="ob-hint"></div>
   </div>
@@ -155,6 +162,9 @@
       </button>
       <button id="tool-zoom" class="tool" title="Zoom (Z)" aria-label="Zoom">
         <svg width="15" height="15" viewBox="0 0 15 15"><circle cx="6.5" cy="6.5" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4"/><line x1="9.7" y1="9.7" x2="13" y2="13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+      <button id="tool-shapes" class="tool" title="Shapes — water / parks (H)" aria-label="Shapes">
+        <svg width="15" height="15" viewBox="0 0 15 15"><path d="M2 5 Q5 2 8 5 T13 5 M2 10 Q5 7 8 10 T13 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
       </button>
       <div class="tr-spacer"></div>
       <div class="tr-swatches" title="Selected line color over paper">
@@ -223,6 +233,7 @@
             </defs>
             <g id="world">
               <rect id="grid-rect" x="-10000" y="-10000" width="20000" height="20000" fill="url(#gridpat-major)"/>
+              <g id="layer-features"></g>
               <g id="layer-lines"></g>
               <g id="layer-linelabels"></g>
               <g id="layer-stations"></g>
