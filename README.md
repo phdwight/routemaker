@@ -1,8 +1,7 @@
 # 🚆 RouteMaker
 
-A browser-based designer for beautiful transit / rail network maps in the style of the
-JR East railway network diagram — octilinear colored lines, white station dots, and
-black "pill" labels for major interchanges.
+A browser-based designer for beautiful transit / rail network maps — octilinear
+colored lines, white station dots, and black "pill" labels for major interchanges.
 
 No build step, no dependencies — plain HTML + SVG + JavaScript, served by nginx.
 
@@ -71,7 +70,7 @@ shortcuts below.
 - **Stations** — regular stops render as white dots ringed in the line color; major
   interchanges get a large black-ringed circle and a rotatable black pill label.
   Label position (8 compass directions) and angle are editable per station.
-- **Lines** — name, color palette (JR-inspired) or custom color, thickness, numbered
+- **Lines** — name, preset color palette or custom color, thickness, numbered
   badge, open/closed loop, corner radius (turns are softened with arcs; corners that
   hold stations stay sharp so the dot sits on the line), and one of ten textures per
   line: solid, white "shinkansen stripe", dashed, dotted, broken (white ticks),
