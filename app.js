@@ -151,8 +151,85 @@ function darken(hex, f = 0.62) {
   return "#" + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
 }
 
-// ---- texture pattern paints (diagonal hatch / zigzag), one def per color
+// ---- direction-following ornaments (hatch / zigzag / wave / chevron / crosshatch / rail)
+// Marks are placed ALONG the centre-line and oriented to the local tangent, so the
+// texture reads the same on horizontal, vertical and diagonal segments alike.
 let sceneDefs = el("defs"), scenePatterns = new Map();
+
+// Walk the rendered polyline and yield {x,y,tx,ty} samples every `step` units.
+function samplePath(rp, closed, step) {
+  const out = [];
+  const n = closed ? rp.length : rp.length - 1;
+  let carry = step / 2;
+  for (let i = 0; i < n; i++) {
+    const a = rp[i], b = rp[(i + 1) % rp.length];
+    const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+    if (len < 0.01) continue;
+    const tx = dx / len, ty = dy / len;
+    let d = carry;
+    while (d <= len) { out.push({ x: a.x + tx * d, y: a.y + ty * d, tx, ty }); d += step; }
+    carry = d - len;
+  }
+  return out;
+}
+
+// A white poly-line that oscillates perpendicular to the path (wave = sine, zigzag = triangle).
+function oscPath(rp, closed, amp, wavelen, kind) {
+  const pts = [];
+  const n = closed ? rp.length : rp.length - 1;
+  const sample = Math.max(1.5, wavelen / 8);
+  let s = 0;
+  const emit = (x, y, tx, ty, dist) => {
+    const f = ((dist / wavelen) % 1 + 1) % 1;
+    const off = (kind === "wave" ? Math.sin(f * Math.PI * 2) : (1 - 4 * Math.abs(f - 0.5))) * amp;
+    pts.push(fmt(x - ty * off) + " " + fmt(y + tx * off));
+  };
+  for (let i = 0; i < n; i++) {
+    const a = rp[i], b = rp[(i + 1) % rp.length];
+    const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+    if (len < 0.01) continue;
+    const tx = dx / len, ty = dy / len;
+    for (let d = 0; d < len; d += sample) emit(a.x + tx * d, a.y + ty * d, tx, ty, s + d);
+    s += len;
+    emit(b.x, b.y, tx, ty, s);
+  }
+  return pts.length ? "M" + pts.join(" L") : "M0 0";
+}
+
+// Draws the white marks for a mark-based texture on top of the coloured band.
+function drawOrnaments(g, rp, closed, style, w) {
+  if (!rp || rp.length < 2) return;
+  const white = "rgba(255,255,255,0.92)";
+  const half = w * 0.42, sw = Math.max(1.2, w * 0.16);
+  const line2 = (x1, y1, x2, y2) => g.append(el("line", { x1: fmt(x1), y1: fmt(y1), x2: fmt(x2), y2: fmt(y2), stroke: white, "stroke-width": sw, "stroke-linecap": "round" }));
+  if (style === "wave" || style === "zigzag") {
+    g.append(el("path", { d: oscPath(rp, closed, w * 0.3, w * 1.7, style), fill: "none", stroke: white, "stroke-width": Math.max(1.3, w * 0.17), "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    return;
+  }
+  const step = style === "rail" ? w * 0.72 : w * 0.9;
+  for (const s of samplePath(rp, closed, step)) {
+    const nx = -s.ty, ny = s.tx;               // unit normal
+    if (style === "rail") {                     // perpendicular sleeper
+      line2(s.x - nx * half, s.y - ny * half, s.x + nx * half, s.y + ny * half);
+    } else if (style === "hatch") {             // single 45°-to-tangent stripe
+      const ux = (s.tx + nx), uy = (s.ty + ny), l = Math.hypot(ux, uy) || 1;
+      line2(s.x - ux / l * half, s.y - uy / l * half, s.x + ux / l * half, s.y + uy / l * half);
+    } else if (style === "crosshatch") {        // an X
+      let ux = s.tx + nx, uy = s.ty + ny, l = Math.hypot(ux, uy) || 1;
+      line2(s.x - ux / l * half, s.y - uy / l * half, s.x + ux / l * half, s.y + uy / l * half);
+      ux = s.tx - nx; uy = s.ty - ny; l = Math.hypot(ux, uy) || 1;
+      line2(s.x - ux / l * half, s.y - uy / l * half, s.x + ux / l * half, s.y + uy / l * half);
+    } else if (style === "chevron") {           // arrow pointing along the tangent
+      const ax = s.x + s.tx * half, ay = s.y + s.ty * half;
+      g.append(el("path", {
+        d: `M${fmt(s.x - s.tx * half + nx * half)} ${fmt(s.y - s.ty * half + ny * half)} L${fmt(ax)} ${fmt(ay)} L${fmt(s.x - s.tx * half - nx * half)} ${fmt(s.y - s.ty * half - ny * half)}`,
+        fill: "none", stroke: white, "stroke-width": sw, "stroke-linejoin": "round", "stroke-linecap": "round",
+      }));
+    }
+  }
+}
+
+// (legacy) pattern paints kept for reference; no longer used by drawTexturedPath.
 function ensurePattern(kind, color) {
   const key = kind + color;
   if (scenePatterns.has(key)) return scenePatterns.get(key);
@@ -194,7 +271,8 @@ function ensurePattern(kind, color) {
 }
 
 // Draws a path with the line's texture into g (used by the map and the legend).
-function drawTexturedPath(g, d, line, w) {
+// rp/closed are the rendered polyline points, needed for direction-following textures.
+function drawTexturedPath(g, d, line, w, rp, closed) {
   const color = line.color, style = lineStyle(line);
   const push = (attrs) => g.append(el("path", Object.assign(
     { d, fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round" }, attrs)));
@@ -211,7 +289,8 @@ function drawTexturedPath(g, d, line, w) {
     case "chevron":
     case "crosshatch":
     case "rail":
-      push({ stroke: `url(#${ensurePattern(style, color)})`, "stroke-width": w });
+      push({ stroke: color, "stroke-width": w });   // coloured band
+      drawOrnaments(g, rp, closed, style, w);        // white marks that follow the line
       break;
     case "dashdot":
       push({ stroke: color, "stroke-width": w, "stroke-dasharray": `${w * 2.2} ${w} 0.1 ${w}`, "stroke-linecap": "round" });
@@ -532,7 +611,7 @@ function buildScene(g) {
         stroke: ui.paper || "#faf7ef", "stroke-width": line.width + casing * 2,
       }));
     }
-    drawTexturedPath(target, d, line, line.width);
+    drawTexturedPath(target, d, line, line.width, rp, line.closed);
     if (target !== gLines) gLines.append(target);
   }
 
@@ -712,7 +791,7 @@ function buildLegend(g, x, y, maxW) {
     if (cx > x && cx + w > x + maxW) { cx = x; cy += rowH; }
     const ym = cy + rowH / 2;
     const d = `M${fmt(cx)} ${fmt(ym)} L${fmt(cx + 30)} ${fmt(ym)}`;
-    drawTexturedPath(g, d, line, 6);
+    drawTexturedPath(g, d, line, 6, [{ x: cx, y: ym }, { x: cx + 30, y: ym }], false);
     let tx = cx + 38;
     if (line.badge) {
       g.append(el("circle", { cx: fmt(tx + 8), cy: fmt(ym), r: 8, fill: line.color }));
