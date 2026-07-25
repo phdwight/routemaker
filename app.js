@@ -59,9 +59,11 @@ const TOOL_META = {
   guides:  { name: "Guides",  hint: "Drag out of a ruler to add a guide · drop it back on the ruler to remove it" },
   zoom:    { name: "Zoom",    hint: "Click to zoom in · ⌥-click to zoom out · double-click to fit" },
 };
+const ACCENTS = { blue: "#4d8fd6", amber: "#c9902a", teal: "#3f8b95", rose: "#b8556f" };
 let ui = {
   showNav: true,
   paper: PAPER_STOCKS[0],
+  accent: ACCENTS.blue,
   openSections: { station: true, stroke: true, stations: true, labels: true, geometry: false, document: false, history: false },
 };
 function loadUI() {
@@ -978,14 +980,28 @@ const EYE_SVG = '<svg width="13" height="13" viewBox="0 0 13 13"><ellipse cx="6.
 function renderLineList() {
   const ul = document.getElementById("line-list");
   ul.replaceChildren();
-  for (const line of state.lines) {
+  state.lines.forEach((line, idx) => {
     const selected = state.selection && state.selection.lineId === line.id;
     const hidden = line.visible === false;
     const nStops = line.points.filter((p) => p.station).length;
 
     const row = document.createElement("div");
     row.className = "ln-row" + (selected ? " selected" : "");
+    row.draggable = true;
     row.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
+    row.ondragstart = (e) => { e.dataTransfer.setData("text/plain", String(idx)); e.dataTransfer.effectAllowed = "move"; row.classList.add("dragging"); };
+    row.ondragend = () => row.classList.remove("dragging");
+    row.ondragover = (e) => { e.preventDefault(); row.classList.add("drag-over"); };
+    row.ondragleave = () => row.classList.remove("drag-over");
+    row.ondrop = (e) => {
+      e.preventDefault(); row.classList.remove("drag-over");
+      const from = +e.dataTransfer.getData("text/plain");
+      if (Number.isNaN(from) || from === idx) return;
+      snapshot("Reorder lines");
+      const [moved] = state.lines.splice(from, 1);
+      state.lines.splice(idx, 0, moved);
+      renderAll();
+    };
 
     const bar = document.createElement("div"); bar.className = "ln-bar";
 
@@ -1002,6 +1018,8 @@ function renderLineList() {
     const nm = document.createElement("div");
     nm.className = "ln-name" + (hidden ? " hidden-line" : "");
     nm.textContent = line.name || "(unnamed line)";
+    nm.title = "Double-click to rename";
+    nm.ondblclick = (e) => { e.stopPropagation(); startInlineRename(text, nm, line); };
     const meta = document.createElement("div");
     meta.className = "ln-meta";
     meta.textContent = `${nStops} stop${nStops === 1 ? "" : "s"}` + (line.closed ? " · loop" : "");
@@ -1014,7 +1032,22 @@ function renderLineList() {
 
     row.append(bar, eye, chip, text, lock);
     ul.append(row);
-  }
+  });
+}
+function startInlineRename(textEl, nm, line) {
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.className = "ln-rename"; inp.value = line.name || "";
+  let done = false;
+  const commit = (save) => {
+    if (done) return; done = true;
+    if (save) { snapshot("Rename line"); line.name = inp.value.trim() || line.name; }
+    renderAll();
+  };
+  inp.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") commit(true); else if (e.key === "Escape") commit(false); };
+  inp.onblur = () => commit(true);
+  inp.onclick = (e) => e.stopPropagation();
+  textEl.replaceChildren(inp);
+  inp.focus(); inp.select();
 }
 
 // ---------------------------------------------------------------- inspector builders
@@ -1289,6 +1322,19 @@ function applyPaper() {
   if (c) c.style.background = ui.paper;
   const p = document.querySelector(".tr-paper");
   if (p) p.style.background = ui.paper;
+}
+function hexA(hex, a) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+function applyAccent() {
+  const c = ui.accent || ACCENTS.blue;
+  const r = document.documentElement.style;
+  r.setProperty("--acc", c);
+  r.setProperty("--acc-soft", hexA(c, 0.22));
+  r.setProperty("--acc-border", hexA(c, 0.9));
 }
 function applyGrid() {
   const gs = state.gridSize || GRID;
@@ -1715,6 +1761,7 @@ let spaceDown = false;
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closeMenus();
+    if (!shortcutsModal.classList.contains("hidden")) { hideShortcuts(); return; }
     const modal = document.getElementById("open-modal");
     if (!modal.classList.contains("hidden")) { modal.classList.add("hidden"); return; }
   }
@@ -1734,6 +1781,21 @@ window.addEventListener("keydown", (e) => {
     case "d": case "D": setTool("draw"); break;
     case "t": case "T": setTool("label"); break;
     case "z": case "Z": setTool("zoom"); break;
+    case "ArrowUp": case "ArrowDown": case "ArrowLeft": case "ArrowRight": {
+      const sel = state.selection;
+      const line = sel && lineById(sel.lineId);
+      if (!line || line.locked) break;
+      const d = e.shiftKey ? gridStep() * 5 : gridStep();
+      const dx = e.key === "ArrowLeft" ? -d : e.key === "ArrowRight" ? d : 0;
+      const dy = e.key === "ArrowUp" ? -d : e.key === "ArrowDown" ? d : 0;
+      snapshot("Nudge");
+      if (sel.pointIndex != null) { const p = line.points[sel.pointIndex]; p.x += dx; p.y += dy; }
+      else line.points.forEach((p) => { p.x += dx; p.y += dy; });
+      renderAll();
+      e.preventDefault();
+      break;
+    }
+    case "?": showShortcuts(); break;
     case "Enter":
       if (drawing) finishDrawing();
       break;
@@ -1916,6 +1978,8 @@ setupMenu("btn-line", "line-menu", (act) => {
 });
 setupMenu("btn-window", "window-menu", (act) => {
   if (act === "navigator") { ui.showNav = !ui.showNav; saveUI(); renderNavigator(); }
+  else if (act === "shortcuts") showShortcuts();
+  else if (act.startsWith("accent-")) { ui.accent = ACCENTS[act.slice(7)] || ACCENTS.blue; saveUI(); applyAccent(); }
 });
 
 // live pointer readout in the status bar
@@ -2052,6 +2116,31 @@ function hideOpenModal() { openModal.classList.add("hidden"); }
 document.getElementById("open-close").onclick = hideOpenModal;
 openModal.addEventListener("click", (e) => { if (e.target === openModal) hideOpenModal(); });
 
+// ---------------------------------------------------------------- keyboard-shortcuts overlay
+const SHORTCUTS = [
+  ["Tools", [["V", "Select"], ["D", "Draw"], ["S", "Station · cycle a selected stop"], ["T", "Label"], ["G", "Guides"], ["Z", "Zoom"]]],
+  ["Edit", [["⌘Z / ⇧⌘Z", "Undo / Redo"], ["⌫ / Del", "Delete selected point or line"], ["Arrows", "Nudge selection (⇧ = ×5)"], ["Esc", "Cancel drawing · clear selection"]]],
+  ["Draw", [["Click", "Place a point"], ["Click first point", "Close a loop"], ["Double-click / Enter", "Finish the line"]]],
+  ["Canvas", [["Scroll / pinch", "Zoom"], ["Space-drag · middle-drag", "Pan"], ["Drag from a ruler", "Add a guide"], ["Double-click a segment", "Add a bend point"]]],
+];
+const shortcutsModal = document.getElementById("shortcuts-modal");
+function showShortcuts() {
+  const body = document.getElementById("shortcuts-body");
+  body.replaceChildren();
+  for (const [group, items] of SHORTCUTS) {
+    body.append(elh("div", "sc-group", group));
+    for (const [k, desc] of items) {
+      const r = elh("div", "sc-row");
+      r.append(elh("kbd", "sc-key", k), elh("span", "sc-desc", desc));
+      body.append(r);
+    }
+  }
+  shortcutsModal.classList.remove("hidden");
+}
+function hideShortcuts() { shortcutsModal.classList.add("hidden"); }
+document.getElementById("shortcuts-close").onclick = hideShortcuts;
+shortcutsModal.addEventListener("click", (e) => { if (e.target === shortcutsModal) hideShortcuts(); });
+
 document.getElementById("map-name").addEventListener("input", autosave);
 document.getElementById("map-name").addEventListener("keydown", (e) => {
   if (e.key === "Enter") e.target.blur();
@@ -2166,6 +2255,7 @@ function sampleLines() {
 // ---------------------------------------------------------------- boot
 (function boot() {
   loadUI();
+  applyAccent();
   applyPaper();
   applyGrid();
   const s = loadStore();

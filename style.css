@@ -262,6 +262,9 @@ button { font-family: inherit; }
   border: 1px solid #4a4a4a; background: transparent; cursor: pointer; padding: 0;
 }
 .ln-lock.on { background: #c9902a; }
+.ln-row.drag-over { box-shadow: inset 0 2px 0 var(--acc); }
+.ln-row.dragging { opacity: 0.5; }
+.ln-rename { width: 100%; height: 20px; background: #1c1c1c; border: 1px solid var(--acc); border-radius: 3px; color: #ededed; font-size: 11.5px; padding: 0 5px; outline: none; }
 
 .panel-foot {
   flex: none; display: flex; align-items: center; gap: 2px; padding: 5px 7px;
@@ -453,3 +456,11 @@ button { font-family: inherit; }
 .mdel { background: none; border: none; color: #9a6a6a; cursor: pointer; font-size: 13px; }
 .mdel:hover { color: #ff8a8a; }
 .modal-foot { padding: 9px 14px; border-top: 1px solid #1a1a1a; font-size: 11px; color: #7f7f7f; }
+
+/* keyboard-shortcuts overlay */
+.shortcuts-body { padding: 8px 14px 12px; overflow-y: auto; }
+.sc-group { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--t-sum); font-weight: 600; margin: 12px 0 5px; }
+.sc-group:first-child { margin-top: 2px; }
+.sc-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.sc-key { flex: none; min-width: 132px; font: 11px/1.4 var(--mono); color: #dcdcdc; background: #1b1b1b; border: 1px solid #101010; border-radius: 4px; padding: 3px 7px; box-shadow: inset 0 1px 1px rgba(0,0,0,.4); }
+.sc-desc { font-size: 12px; color: #c4c4c4; }

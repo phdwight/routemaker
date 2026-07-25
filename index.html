@@ -63,6 +63,12 @@
         <button id="btn-window" class="mb-menu">Window</button>
         <div id="window-menu" class="menu hidden">
           <button data-act="navigator">Toggle Navigator</button>
+          <button data-act="shortcuts">Keyboard shortcuts…</button>
+          <hr>
+          <button data-act="accent-blue">Accent · Blue</button>
+          <button data-act="accent-amber">Accent · Amber</button>
+          <button data-act="accent-teal">Accent · Teal</button>
+          <button data-act="accent-rose">Accent · Rose</button>
         </div>
       </div>
     </nav>
@@ -262,6 +268,17 @@
     </div>
     <ul id="map-list"></ul>
     <div class="modal-foot">Maps are saved automatically in this browser as you edit.</div>
+  </div>
+</div>
+
+<div id="shortcuts-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>Keyboard shortcuts</h3>
+      <button id="shortcuts-close" title="Close">✕</button>
+    </div>
+    <div id="shortcuts-body" class="shortcuts-body"></div>
+    <div class="modal-foot">Press <b>?</b> any time to open this list.</div>
   </div>
 </div>
 
