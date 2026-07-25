@@ -42,6 +42,27 @@ let nextId = 1;
 const undoStack = [], redoStack = [];
 let geomCache = new Map(); // lineId -> rendered (corridor-offset) points
 
+// ---------------------------------------------------------------- editor UI prefs
+const UI_KEY = "routemaker.ui.v1";
+const PAPER_STOCKS = ["#faf7ef", "#ffffff", "#f2efe6", "#e8e4d8"];
+const TOOL_META = {
+  select:  { name: "Select",  hint: "Drag a point to move it · ⌥-drag or double-click a segment to add a bend" },
+  draw:    { name: "Draw",    hint: "Click to place points · click the first point to close a loop · double-click to finish" },
+  station: { name: "Station", hint: "Click anywhere on a line to add a station · click a station to edit it" },
+};
+let ui = {
+  showNav: true,
+  paper: PAPER_STOCKS[0],
+  openSections: { station: true, stroke: true, stations: true, labels: true, geometry: false, document: false, history: false },
+};
+function loadUI() {
+  try {
+    const u = JSON.parse(localStorage.getItem(UI_KEY));
+    if (u && typeof u === "object") ui = { ...ui, ...u, openSections: { ...ui.openSections, ...(u.openSections || {}) } };
+  } catch (e) { /* ignore */ }
+}
+function saveUI() { try { localStorage.setItem(UI_KEY, JSON.stringify(ui)); } catch (e) { /* ignore */ } }
+
 const svg = document.getElementById("canvas");
 const world = document.getElementById("world");
 const layers = {
@@ -440,7 +461,7 @@ function buildScene(g) {
 
   // ---- lines (with per-line texture)
   for (const line of state.lines) {
-    if (line.points.length < 2) continue;
+    if (line.points.length < 2 || line.visible === false) continue;
     const rp = geom.get(line.id);
     const stationAt = line.points.map((p) => !!p.station);
     const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, line.points);
@@ -450,7 +471,7 @@ function buildScene(g) {
   // ---- line names at termini
   if (state.showLineNames) {
     for (const line of state.lines) {
-      if (line.points.length < 2 || !line.name) continue;
+      if (line.points.length < 2 || !line.name || line.visible === false) continue;
       const rp = geom.get(line.id);
       let px, py, ux = 1, uy = 0;
       if (line.closed) {
@@ -490,6 +511,7 @@ function buildScene(g) {
   // vertices grouped by raw coordinate, for capsule interchange markers
   const atCoord = new Map(); // "x,y" -> [{line, rp:{x,y}}]
   state.lines.forEach((line) => {
+    if (line.visible === false) return;
     const rp = geom.get(line.id);
     line.points.forEach((p, i) => {
       const key = p.x + "," + p.y;
@@ -588,7 +610,7 @@ function buildStationLabel(p, st, r) {
 
 // Draws the legend into g at (x,y), wrapping within maxW. Returns its height.
 function buildLegend(g, x, y, maxW) {
-  const items = state.lines.filter((l) => l.name && l.points.length > 1);
+  const items = state.lines.filter((l) => l.name && l.points.length > 1 && l.visible !== false);
   if (!items.length) return 0;
   const rowH = 28;
   g.append(el("line", {
@@ -692,8 +714,8 @@ function applyView() {
   world.setAttribute("transform",
     `translate(${state.view.x},${state.view.y}) scale(${state.view.scale})`);
   gridRect.style.display = state.showGrid ? "" : "none";
-  document.getElementById("status-zoom").textContent =
-    Math.round(state.view.scale * 100) + "%";
+  const z = Math.round(state.view.scale * 100) + "%";
+  setText("status-zoom", z); setText("sb-zoom", z); setText("nav-zoom", z);
 }
 
 function renderAll() {
@@ -701,226 +723,399 @@ function renderAll() {
   renderScene();
   renderLineList();
   renderProps();
+  renderNavigator();
+  syncOptionsBar();
   updateStatus();
   autosave();
 }
 
+// small DOM helpers for the chrome
+function setText(id, txt) { const n = document.getElementById(id); if (n) n.textContent = txt; }
+function stationCount() {
+  return state.lines.reduce((n, l) => n + l.points.filter((p) => p.station).length, 0);
+}
+
 function updateStatus() {
-  const hint = document.getElementById("status-hint");
-  if (drawing) hint.textContent = "Placing points — click first point to close loop · double-click / Enter to finish · Esc to cancel last";
-  else if (state.tool === "draw") hint.textContent = "Click to start a new line · click a ring on an existing line's endpoint to extend it";
-  else if (state.tool === "station") hint.textContent = "Click anywhere on a line to add a station · click an existing station to edit it";
-  else hint.textContent = "Drag points to move · ⌥-drag or double-click a segment to add a bend · Draw tool extends lines from their endpoints";
+  // options-bar contextual hint
+  let hint = (TOOL_META[state.tool] || TOOL_META.select).hint;
+  if (drawing) hint = "Placing points · click the first point to close a loop · double-click / Enter to finish · Esc undoes last";
+  setText("ob-hint", hint);
+
+  // status bar readouts
+  const nStations = stationCount();
+  const nLines = state.lines.filter((l) => l.visible !== false).length;
+  setText("sb-snap", state.snap45 ? "45° snap" : "Free angle");
+  setText("sb-counts", `${nLines} line${nLines === 1 ? "" : "s"} · ${nStations} station${nStations === 1 ? "" : "s"}`);
+  setText("line-stats", `${nLines} line${nLines === 1 ? "" : "s"} · ${nStations} station${nStations === 1 ? "" : "s"}`);
+  setText("line-count", String(state.lines.length));
+
+  const sel = state.selection && lineById(state.selection.lineId);
+  if (!sel) setText("sb-sel", "No selection");
+  else if (state.selection.pointIndex != null) {
+    const p = sel.points[state.selection.pointIndex];
+    setText("sb-sel", (p && p.station ? p.station.name || "Station" : "Point") + " · " + (sel.name || "line"));
+  } else setText("sb-sel", (sel.name || "line") + " · " + sel.points.length + " points");
+}
+
+function syncOptionsBar() {
+  toggleAttr("opt-grid", state.showGrid);
+  toggleAttr("opt-snap", state.snap45);
+  toggleAttr("opt-labels", state.showLineNames);
+  toggleAttr("opt-legend", state.showLegend);
+  const sel = state.selection && lineById(state.selection.lineId);
+  setText("ob-stroke", sel ? fmt(sel.width) + " pt" : "—");
+  setText("ob-corner", sel ? lineCorner(sel) + " pt" : "—");
+  const chip = document.getElementById("ob-color");
+  if (chip) chip.style.background = sel ? sel.color : "#3a3a3a";
+  const ink = document.getElementById("tr-ink");
+  if (ink) ink.style.background = sel ? sel.color : "var(--acc)";
+  const paper = document.querySelector(".tr-paper");
+  if (paper) paper.style.background = ui.paper;
+}
+function toggleAttr(id, on) {
+  const n = document.getElementById(id);
+  if (n) n.setAttribute("data-on", on ? "1" : "0");
+}
+
+function renderNavigator() {
+  const nav = document.getElementById("navigator");
+  if (nav) nav.classList.toggle("hidden", !ui.showNav);
+  const svg2 = document.getElementById("nav-svg");
+  if (!svg2 || !ui.showNav) return;
+  svg2.replaceChildren();
+  const bb = rawBounds();
+  const VW = 222, VH = 138, pad = 8;
+  if (!bb) return;
+  const s = Math.min((VW - pad * 2) / bb.w, (VH - pad * 2) / bb.h);
+  const ox = (VW - bb.w * s) / 2 - bb.minX * s;
+  const oy = (VH - bb.h * s) / 2 - bb.minY * s;
+  const g = el("g", { transform: `translate(${fmt(ox)},${fmt(oy)}) scale(${fmt(s)})` });
+  for (const line of state.lines) {
+    if (line.points.length < 2 || line.visible === false) continue;
+    const rp = geomCache.get(line.id) || line.points;
+    const stationAt = line.points.map((p) => !!p.station);
+    const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, line.points);
+    g.append(el("path", { d, fill: "none", stroke: line.color, "stroke-width": Math.max(line.width, 6), "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  }
+  svg2.append(g);
 }
 
 // ---------------------------------------------------------------- sidebar
+const EYE_SVG = '<svg width="13" height="13" viewBox="0 0 13 13"><ellipse cx="6.5" cy="6.5" rx="6" ry="3.6" fill="none" stroke="currentColor" stroke-width="1.1"/><circle cx="6.5" cy="6.5" r="1.7" fill="currentColor"/></svg>';
 function renderLineList() {
   const ul = document.getElementById("line-list");
   ul.replaceChildren();
   for (const line of state.lines) {
-    const li = document.createElement("li");
-    if (state.selection && state.selection.lineId === line.id) li.classList.add("selected");
+    const selected = state.selection && state.selection.lineId === line.id;
+    const hidden = line.visible === false;
+    const nStops = line.points.filter((p) => p.station).length;
+
+    const row = document.createElement("div");
+    row.className = "ln-row" + (selected ? " selected" : "");
+    row.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
+
+    const bar = document.createElement("div"); bar.className = "ln-bar";
+
+    const eye = document.createElement("button");
+    eye.className = "ln-eye" + (hidden ? " off" : "");
+    eye.innerHTML = EYE_SVG;
+    eye.title = hidden ? "Show line" : "Hide line";
+    eye.onclick = (e) => { e.stopPropagation(); line.visible = hidden; renderAll(); };
+
     const chip = document.createElement("span");
-    if (line.badge) {
-      chip.className = "line-badge";
-      chip.style.background = line.color;
-      chip.textContent = line.badge;
-    } else {
-      chip.className = "line-chip";
-      chip.style.background = line.color;
-    }
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = line.name || "(unnamed line)";
-    const del = document.createElement("button");
-    del.className = "del"; del.textContent = "✕"; del.title = "Delete line";
-    del.onclick = (e) => {
-      e.stopPropagation();
-      snapshot();
-      state.lines = state.lines.filter((l) => l.id !== line.id);
-      if (state.selection?.lineId === line.id) state.selection = null;
-      renderAll();
-    };
-    li.append(chip, name, del);
-    li.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
-    ul.append(li);
+    chip.className = "ln-chip"; chip.style.background = line.color;
+
+    const text = document.createElement("div"); text.className = "ln-text";
+    const nm = document.createElement("div");
+    nm.className = "ln-name" + (hidden ? " hidden-line" : "");
+    nm.textContent = line.name || "(unnamed line)";
+    const meta = document.createElement("div");
+    meta.className = "ln-meta";
+    meta.textContent = `${nStops} stop${nStops === 1 ? "" : "s"}` + (line.closed ? " · loop" : "");
+    text.append(nm, meta);
+
+    const lock = document.createElement("button");
+    lock.className = "ln-lock" + (line.locked ? " on" : "");
+    lock.title = line.locked ? "Unlock line" : "Lock line";
+    lock.onclick = (e) => { e.stopPropagation(); line.locked = !line.locked; renderAll(); };
+
+    row.append(bar, eye, chip, text, lock);
+    ul.append(row);
   }
 }
 
-function field(labelText, inputEl) {
-  const d = document.createElement("div");
-  d.className = "field";
-  const lab = document.createElement("label");
-  lab.className = "f"; lab.textContent = labelText;
-  d.append(lab, inputEl);
-  return d;
+// ---------------------------------------------------------------- inspector builders
+function elh(tag, cls, txt) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (txt != null) n.textContent = txt;
+  return n;
 }
-function mkInput(type, value, onchange, attrs = {}) {
-  const i = document.createElement("input");
-  i.type = type; i.value = value;
-  Object.assign(i, attrs);
-  let snapped = false; // one undo snapshot per focus session, taken before the first edit
-  const commit = () => {
-    if (!snapped) { snapshot(); snapped = true; }
-    onchange(i); renderScene(); renderLineList(); autosave();
+// live line edit that must NOT rebuild the inspector (keeps sliders/inputs alive)
+function liveEdit() { renderScene(); renderLineList(); syncOptionsBar(); renderNavigator(); updateStatus(); autosave(); }
+
+function propSlider(label, min, max, step, value, fmtVal, onInput, opts = {}) {
+  const row = elh("div", "prow" + (opts.disabled ? " disabled" : ""));
+  row.append(elh("span", "prow-lab", label));
+  const sl = elh("div", "slider");
+  const track = elh("div", "strack"), fill = elh("div", "sfill"), handle = elh("div", "shandle");
+  const input = document.createElement("input");
+  input.type = "range"; input.className = "sinput";
+  input.min = min; input.max = max; input.step = step; input.value = value;
+  if (opts.disabled) input.disabled = true;
+  const field = elh("span", "sfield");
+  const upd = (v) => {
+    const pct = (max === min) ? 0 : (v - min) / (max - min) * 100;
+    fill.style.width = pct + "%"; handle.style.left = pct + "%"; field.textContent = fmtVal(v);
   };
-  i.addEventListener("focus", () => { snapped = false; });
-  i.addEventListener("input", commit);
-  i.addEventListener("change", commit);
-  return i;
+  upd(+value);
+  let snapped = false;
+  input.addEventListener("pointerdown", () => { snapped = false; });
+  input.addEventListener("input", () => {
+    if (!snapped) { snapshot(); snapped = true; }
+    const v = +input.value; upd(v); onInput(v); liveEdit();
+  });
+  sl.append(track, fill, handle, input);
+  row.append(sl, field);
+  return row;
 }
-function mkSelect(options, value, onchange) {
-  const s = document.createElement("select");
-  for (const [v, label] of options) {
-    const o = document.createElement("option");
-    o.value = v; o.textContent = label;
-    if (v === value) o.selected = true;
-    s.append(o);
+function propSeg(label, options, value, onPick) {
+  const row = elh("div", "prow");
+  row.append(elh("span", "prow-lab", label));
+  const seg = elh("div", "seg");
+  for (const [v, lab, inert] of options) {
+    const b = elh("button", "seg-btn" + (v === value ? " active" : "") + (inert ? " inert" : ""), lab);
+    if (!inert) b.onclick = () => onPick(v);
+    seg.append(b);
   }
-  s.addEventListener("change", () => { snapshot(); onchange(s); renderScene(); renderProps(); autosave(); });
-  return s;
+  row.append(seg);
+  return row;
 }
+function propSelect(label, options, value, onPick) {
+  const row = elh("div", "prow");
+  row.append(elh("span", "prow-lab", label));
+  const s = document.createElement("select");
+  for (const [v, lab] of options) {
+    const o = document.createElement("option"); o.value = v; o.textContent = lab;
+    if (v === value) o.selected = true; s.append(o);
+  }
+  s.onchange = () => onPick(s.value);
+  row.append(s);
+  return row;
+}
+function propText(label, value, onInput, attrs = {}) {
+  const row = elh("div", "prow");
+  row.append(elh("span", "prow-lab", label));
+  const i = document.createElement("input");
+  i.type = "text"; i.value = value; Object.assign(i, attrs);
+  let snapped = false;
+  i.addEventListener("focus", () => { snapped = false; });
+  i.addEventListener("input", () => {
+    if (!snapped) { snapshot(); snapped = true; }
+    onInput(i.value); renderScene(); renderLineList(); syncOptionsBar(); updateStatus(); autosave();
+  });
+  row.append(i);
+  return row;
+}
+function propCheck(label, checked, onToggle, opts = {}) {
+  const row = elh("div", "ck2" + (checked ? " on" : "") + (opts.disabled ? " disabled prow disabled" : ""));
+  row.append(elh("span", "ck"), elh("span", "ck2-lab", label));
+  if (!opts.disabled) row.onclick = () => onToggle(!checked);
+  return row;
+}
+function section(key, title, summary, buildBody) {
+  const sec = elh("div", "insp-section" + (ui.openSections[key] ? " open" : ""));
+  const head = elh("div", "sec-head");
+  head.append(elh("span", "sec-caret", "▸"), elh("span", "sec-title", title), elh("span", "sec-sum", summary));
+  head.onclick = () => { ui.openSections[key] = !ui.openSections[key]; saveUI(); sec.classList.toggle("open"); };
+  const body = elh("div", "sec-body");
+  buildBody(body);
+  sec.append(head, body);
+  return sec;
+}
+function commitPick(mutate) { snapshot(); mutate(); renderScene(); renderProps(); renderLineList(); syncOptionsBar(); renderNavigator(); updateStatus(); autosave(); }
+function lineBounds(line) {
+  const xs = line.points.map((p) => p.x), ys = line.points.map((p) => p.y);
+  if (!xs.length) return { x: 0, y: 0, w: 0, h: 0 };
+  const minX = Math.min(...xs), minY = Math.min(...ys), maxX = Math.max(...xs), maxY = Math.max(...ys);
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+function styleLabel(v) { return (LINE_STYLES.find(([s]) => s === v) || [null, "Solid"])[1]; }
 
 function renderProps() {
+  const hd = document.getElementById("inspector-header");
   const box = document.getElementById("props");
-  const title = document.getElementById("props-title");
-  box.replaceChildren();
+  if (!hd || !box) return;
+  hd.replaceChildren(); box.replaceChildren();
   const sel = state.selection;
   const line = sel && lineById(sel.lineId);
+
   if (!line) {
-    title.textContent = "Properties";
-    const p = document.createElement("p");
-    p.className = "hint";
-    p.innerHTML = "Select a line, or a station point, to edit it.<br><br>" +
-      "<b>Station tool (S):</b> click anywhere on a line to add a station there; click an existing station to edit it.<br>" +
-      "<b>Draw tool (D):</b> click to place points, click the first point to close a loop, double-click / Enter to finish. " +
-      "Click an endpoint of an existing line (marked with a ring) to extend it. " +
-      "Draw along an existing line to share its corridor — parallel tracks fan out automatically.<br>" +
-      "<b>Select tool (V):</b> drag points to move, ⌥-drag or double-click a segment to add a bend point.";
-    box.append(p);
+    const e = elh("div", "insp-empty");
+    e.innerHTML = "Select a line, or a station point, to edit it.<br><br>" +
+      "<b>Draw (D)</b> places points — click the first point to close a loop.<br>" +
+      "<b>Station (S)</b> adds a stop anywhere on a line.<br>" +
+      "<b>Select (V)</b> drags points; ⌥-drag or double-click a segment to add a bend.";
+    box.append(e);
     return;
   }
 
-  if (sel.pointIndex == null) {
-    // ---- line properties
-    title.textContent = "Line";
-    box.append(field("Name", mkInput("text", line.name, (i) => (line.name = i.value))));
+  buildInspectorHeader(hd, line);
+  if (sel.pointIndex != null) box.append(buildStationSection(line, sel.pointIndex));
+  box.append(buildStrokeSection(line));
+  box.append(buildStationsSection(line));
+  box.append(buildLabelsSection(line));
+  box.append(buildGeometrySection(line));
+  box.append(buildDocumentSection());
+  box.append(buildHistorySection());
+}
 
-    const sw = document.createElement("div");
-    sw.className = "swatches";
-    for (const c of PALETTE) {
-      const b = document.createElement("button");
-      b.className = "swatch" + (line.color.toLowerCase() === c.toLowerCase() ? " sel" : "");
-      b.style.background = c;
-      b.onclick = () => { snapshot(); line.color = c; renderScene(); renderLineList(); renderProps(); autosave(); };
-      sw.append(b);
+function buildInspectorHeader(hd, line) {
+  const r1 = elh("div", "ihd-row");
+  const chip = elh("div", "insp-color"); chip.style.background = line.color;
+  const colorIn = document.createElement("input");
+  colorIn.type = "color"; colorIn.value = /^#[0-9a-f]{6}$/i.test(line.color) ? line.color : "#4d8fd6";
+  colorIn.style.cssText = "position:absolute;width:0;height:0;opacity:0;pointer-events:none";
+  let colorSnapped = false;
+  colorIn.oninput = () => {
+    if (!colorSnapped) { snapshot(); colorSnapped = true; }
+    line.color = colorIn.value; chip.style.background = colorIn.value; liveEdit();
+  };
+  colorIn.onchange = () => { colorSnapped = false; renderProps(); };
+  chip.title = "Click for a custom color";
+  chip.onclick = () => colorIn.click();
+  const name = document.createElement("input");
+  name.type = "text"; name.className = "insp-name"; name.value = line.name || "";
+  let snapped = false;
+  name.addEventListener("focus", () => { snapped = false; });
+  name.addEventListener("input", () => {
+    if (!snapped) { snapshot(); snapped = true; }
+    line.name = name.value; renderScene(); renderLineList(); updateStatus(); autosave();
+  });
+  r1.append(chip, name, colorIn);
+
+  const r2 = elh("div", "ihd-row");
+  r2.append(elh("span", "ihd-lab", "Type"));
+  const typeSel = document.createElement("select"); typeSel.className = "insp-type";
+  for (const [v, lab] of LINE_STYLES) {
+    const o = document.createElement("option"); o.value = v; o.textContent = lab;
+    if (v === lineStyle(line)) o.selected = true; typeSel.append(o);
+  }
+  typeSel.onchange = () => commitPick(() => (line.style = typeSel.value));
+  r2.append(typeSel, elh("span", "insp-id", line.id));
+
+  const pal = elh("div", "insp-palette");
+  for (const c of PALETTE) {
+    const b = elh("button", "pal" + (line.color.toLowerCase() === c.toLowerCase() ? " sel" : ""));
+    b.style.background = c;
+    b.onclick = () => commitPick(() => (line.color = c));
+    pal.append(b);
+  }
+  hd.append(r1, r2, pal);
+}
+
+function buildStrokeSection(line) {
+  return section("stroke", "Stroke", fmt(line.width) + " pt · " + styleLabel(lineStyle(line)), (body) => {
+    body.append(propSlider("Width", 3, 16, 1, line.width, (v) => v + " pt", (v) => (line.width = v)));
+    body.append(propSlider("Casing", 0, 6, 1, 0, (v) => v + " pt", () => {}, { disabled: true }));
+    body.append(propSlider("Corner", 0, 40, 2, lineCorner(line), (v) => v + " pt", (v) => (line.corner = v)));
+    body.append(propSlider("Opacity", 10, 100, 5, 100, (v) => v + "%", () => {}, { disabled: true }));
+    body.append(propText("Badge", line.badge || "", (v) => (line.badge = v.trim()), { maxLength: 3, placeholder: "e.g. 9" }));
+  });
+}
+function buildStationsSection(line) {
+  return section("stations", "Stations", "Dot", (body) => {
+    body.append(propSeg("Marker", [["dot", "Dot"], ["ring", "Ring", true], ["tick", "Tick", true]], "dot", () => {}));
+    body.append(propSlider("Size", 1.5, 8, 0.5, 3.2, (v) => v + " pt", () => {}, { disabled: true }));
+    body.append(propCheck("Interchange rings", true, () => {}, { disabled: true }));
+  });
+}
+function buildLabelsSection(line) {
+  return section("labels", "Labels", "Per station", (body) => {
+    body.append(propSlider("Size", 7, 16, 0.5, 9.5, (v) => v + " pt", () => {}, { disabled: true }));
+    body.append(propSelect("Position", [["e", "Right"], ["w", "Left"], ["n", "Above"], ["s", "Below"]], "e", () => {}));
+    body.querySelector("select").disabled = true; body.querySelector(".prow:last-child").classList.add("disabled");
+    body.append(propCheck("Halo behind text", true, () => {}, { disabled: true }));
+    const hint = elh("div", "hist-item", "Select a station point to edit its label →");
+    body.append(hint);
+  });
+}
+function buildGeometrySection(line) {
+  const b = lineBounds(line);
+  return section("geometry", "Geometry", state.snap45 ? "45° snap" : "Free", (body) => {
+    body.append(propSeg("Snap", [["45", "45°"], ["30", "30°", true], ["90", "90°", true], ["free", "Free"]],
+      state.snap45 ? "45" : "free",
+      (v) => { state.snap45 = (v === "45"); toggleAttr("opt-snap", state.snap45); renderProps(); updateStatus(); }));
+    const bg = elh("div", "bounds-grid");
+    bg.append(elh("span", "bl", "X"), elh("span", "bv", Math.round(b.x)),
+              elh("span", "bl", "Y"), elh("span", "bv", Math.round(b.y)),
+              elh("span", "bl", "W"), elh("span", "bv", Math.round(b.w)),
+              elh("span", "bl", "H"), elh("span", "bv", Math.round(b.h)));
+    body.append(elh("div", "prow-lab", "Bounds"), bg);
+    body.append(propCheck("Closed loop", !!line.closed, (v) => commitPick(() => (line.closed = v))));
+    body.append(propCheck("Lock this line", !!line.locked, (v) => { line.locked = v; renderLineList(); renderProps(); }));
+  });
+}
+function buildDocumentSection() {
+  return section("document", "Document", GRID + " pt grid", (body) => {
+    body.append(propSlider("Grid", 8, 64, 1, GRID, (v) => v + " pt", () => {}, { disabled: true }));
+    body.append(propSlider("Contrast", 0, 100, 5, 55, (v) => v + "%", () => {}, { disabled: true }));
+    const row = elh("div", "prow"); row.append(elh("span", "prow-lab", "Paper"));
+    const strip = elh("div", "paper-strip");
+    for (const c of PAPER_STOCKS) {
+      const sw = elh("button", "paper-sw" + (ui.paper === c ? " sel" : "")); sw.style.background = c;
+      sw.onclick = () => { ui.paper = c; saveUI(); applyPaper(); renderProps(); };
+      strip.append(sw);
     }
-    box.append(field("Color", sw));
+    row.append(strip); body.append(row);
+  });
+}
+function buildHistorySection() {
+  const n = undoStack.length;
+  return section("history", "History", n + " step" + (n === 1 ? "" : "s"), (body) => {
+    const list = elh("div", "hist-list");
+    list.append(elh("div", "hist-item current", "● Current state"));
+    for (let i = 0; i < Math.min(n, 8); i++) list.append(elh("div", "hist-item", "Edit " + (n - i)));
+    if (!n) list.append(elh("div", "hist-item", "No history yet"));
+    body.append(list);
+  });
+}
 
-    const custom = mkInput("color", line.color, (i) => (line.color = i.value));
-    custom.style.width = "100%"; custom.style.height = "26px";
-    box.append(field("Custom color", custom));
-
-    box.append(field("Texture", mkSelect(LINE_STYLES, lineStyle(line), (s) => (line.style = s.value))));
-
-    const width = mkInput("range", line.width, (i) => (line.width = +i.value), { min: 3, max: 16, step: 1 });
-    box.append(field("Thickness — " + line.width, width));
-    width.addEventListener("input", () => {
-      width.parentElement.querySelector("label").textContent = "Thickness — " + width.value;
-    });
-
-    const corner = mkInput("range", lineCorner(line), (i) => (line.corner = +i.value), { min: 0, max: 40, step: 2 });
-    box.append(field("Corner radius — " + lineCorner(line), corner));
-    corner.addEventListener("input", () => {
-      corner.parentElement.querySelector("label").textContent = "Corner radius — " + corner.value;
-    });
-
-    box.append(field("Badge (number in circle)", mkInput("text", line.badge || "", (i) => (line.badge = i.value.trim()), { maxLength: 3, placeholder: "e.g. 9" })));
-
-    const closed = document.createElement("label");
-    closed.className = "chk";
-    const cb = document.createElement("input");
-    cb.type = "checkbox"; cb.checked = !!line.closed;
-    cb.onchange = () => { snapshot(); line.closed = cb.checked; renderScene(); autosave(); };
-    closed.append(cb, document.createTextNode(" Closed loop"));
-    box.append(field("", closed));
-
-    const dup = document.createElement("button");
-    dup.textContent = "⧉ Duplicate as parallel line"; dup.style.width = "100%"; dup.style.marginBottom = "8px";
-    dup.title = "Copy this line's route — the copy shares the corridor and fans out beside it";
-    dup.onclick = () => {
-      snapshot();
-      const copy = clone(line);
-      copy.id = uid();
-      copy.name = line.name + " (parallel)";
-      copy.badge = "";
-      copy.points.forEach((p) => (p.station = null));
-      const used = new Set(state.lines.map((l) => l.color));
-      copy.color = PALETTE.find((c) => !used.has(c)) || copy.color;
-      state.lines.push(copy);
-      state.selection = { lineId: copy.id };
-      renderAll();
-    };
-    box.append(dup);
-
-    const delBtn = document.createElement("button");
-    delBtn.className = "danger"; delBtn.textContent = "Delete line"; delBtn.style.width = "100%";
-    delBtn.onclick = () => {
-      snapshot();
-      state.lines = state.lines.filter((l) => l.id !== line.id);
-      state.selection = null;
-      renderAll();
-    };
-    box.append(delBtn);
-  } else {
-    // ---- point / station properties
-    const p = line.points[sel.pointIndex];
-    title.textContent = "Point on " + (line.name || "line");
-    const typeSel = mkSelect(
-      [["none", "No station"], ["normal", "Station"], ["major", "Major station (black pill)"]],
+function buildStationSection(line, idx) {
+  const p = line.points[idx];
+  return section("station", "Station", p.station ? (p.station.type === "major" ? "Major" : "Stop") : "None", (body) => {
+    body.append(propSelect("Type", [["none", "No station"], ["normal", "Station"], ["major", "Major (pill)"]],
       p.station ? p.station.type : "none",
-      (s) => {
-        if (s.value === "none") p.station = null;
-        else if (!p.station) p.station = { name: "Station", type: s.value, dir: "e", rot: 0 };
-        else p.station.type = s.value;
-      });
-    box.append(field("Station type", typeSel));
-
+      (v) => commitPick(() => {
+        if (v === "none") p.station = null;
+        else if (!p.station) p.station = { name: "Station", type: v, dir: "e", rot: 0 };
+        else p.station.type = v;
+      })));
     if (p.station) {
       const st = p.station;
-      const nameIn = mkInput("text", st.name, (i) => (st.name = i.value));
-      box.append(field("Station name", nameIn));
-
-      box.append(field("Label position", mkSelect(
-        [["e", "Right"], ["w", "Left"], ["n", "Above"], ["s", "Below"],
-         ["ne", "Upper right"], ["nw", "Upper left"], ["se", "Lower right"], ["sw", "Lower left"]],
-        st.dir || "e", (s) => (st.dir = s.value))));
-
-      const rot = mkInput("range", st.rot || 0, (i) => (st.rot = +i.value), { min: -90, max: 90, step: 5 });
-      box.append(field("Label angle — " + (st.rot || 0) + "°", rot));
-      rot.addEventListener("input", () => {
-        rot.parentElement.querySelector("label").textContent = "Label angle — " + rot.value + "°";
-      });
+      body.append(propText("Name", st.name || "", (v) => (st.name = v)));
+      body.append(propSelect("Position",
+        [["e", "Right"], ["w", "Left"], ["n", "Above"], ["s", "Below"], ["ne", "Upper right"], ["nw", "Upper left"], ["se", "Lower right"], ["sw", "Lower left"]],
+        st.dir || "e", (v) => commitPick(() => (st.dir = v))));
+      body.append(propSlider("Angle", -90, 90, 5, st.rot || 0, (v) => v + "°", (v) => (st.rot = v)));
     }
-
-    const row = document.createElement("div");
-    row.className = "btn-row";
-    const delPt = document.createElement("button");
-    delPt.textContent = "Delete point";
-    delPt.onclick = () => {
+    const dz = elh("div", "sec-danger");
+    const del = elh("button", null, "Delete point");
+    del.onclick = () => {
       snapshot();
-      line.points.splice(sel.pointIndex, 1);
+      line.points.splice(idx, 1);
       if (line.points.length < 2) state.lines = state.lines.filter((l) => l.id !== line.id);
       state.selection = { lineId: line.id };
-      validateSelection();
-      renderAll();
+      validateSelection(); renderAll();
     };
-    const toLine = document.createElement("button");
-    toLine.textContent = "Select line";
-    toLine.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
-    row.append(delPt, toLine);
-    box.append(row);
-  }
+    dz.append(del); body.append(dz);
+  });
+}
+function applyPaper() {
+  const c = document.getElementById("canvas");
+  if (c) c.style.background = ui.paper;
+  const p = document.querySelector(".tr-paper");
+  if (p) p.style.background = ui.paper;
 }
 
 // ---------------------------------------------------------------- hit testing
@@ -928,9 +1123,10 @@ function renderProps() {
 // track the user sees; indices map back to the raw editable points.
 function hitTest(w) {
   const tol = 9 / state.view.scale;
+  const visible = state.lines.filter((l) => l.visible !== false);
   const linesOrdered = state.selection
-    ? [lineById(state.selection.lineId), ...state.lines.filter((l) => l.id !== state.selection.lineId)].filter(Boolean)
-    : [...state.lines].reverse();
+    ? [lineById(state.selection.lineId), ...visible.filter((l) => l.id !== state.selection.lineId)].filter(Boolean)
+    : [...visible].reverse();
   for (const line of linesOrdered) {
     const rp = geomCache.get(line.id) || line.points;
     for (let i = 0; i < line.points.length; i++) {
@@ -958,12 +1154,19 @@ function hitTest(w) {
 let mouse = null; // {mode, startClient, startView, line, index, orig, moved}
 
 function setTool(t) {
+  if (!TOOL_META[t]) return; // ignore inert tools (label/guides/zoom)
   state.tool = t;
   if (t !== "draw") finishDrawing();
-  document.getElementById("tool-select").classList.toggle("active", t === "select");
-  document.getElementById("tool-draw").classList.toggle("active", t === "draw");
-  document.getElementById("tool-station").classList.toggle("active", t === "station");
+  const ids = { select: "tool-select", draw: "tool-draw", station: "tool-station" };
+  for (const [tool, id] of Object.entries(ids)) {
+    document.getElementById(id).classList.toggle("active", t === tool);
+  }
   svg.classList.toggle("tool-draw", t === "draw" || t === "station");
+  // options-bar tool glyph mirrors the active rail button; name from metadata
+  const railBtn = document.getElementById(ids[t]);
+  const glyph = document.getElementById("ob-tool-glyph");
+  if (railBtn && glyph) glyph.innerHTML = railBtn.innerHTML;
+  setText("ob-tool-name", TOOL_META[t].name);
   updateStatus();
   renderOverlay();
 }
@@ -1118,6 +1321,14 @@ function onPointerDown(e) {
 
   // select tool
   const hit = hitTest(w);
+  if (hit && hit.line.locked) {
+    // locked lines can be selected but not edited on the canvas
+    state.selection = hit.type === "point"
+      ? { lineId: hit.line.id, pointIndex: hit.index }
+      : { lineId: hit.line.id };
+    renderAll();
+    return;
+  }
   if (hit && hit.type === "point") {
     state.selection = { lineId: hit.line.id, pointIndex: hit.index };
     mouse = {
@@ -1360,7 +1571,7 @@ window.addEventListener("keydown", (e) => {
     }
     case "g": case "G":
       state.showGrid = !state.showGrid;
-      document.getElementById("opt-grid").checked = state.showGrid;
+      toggleAttr("opt-grid", state.showGrid);
       applyView();
       break;
   }
@@ -1443,14 +1654,67 @@ function exportJSONFile() {
 document.getElementById("tool-select").onclick = () => setTool("select");
 document.getElementById("tool-draw").onclick = () => setTool("draw");
 document.getElementById("tool-station").onclick = () => setTool("station");
-document.getElementById("btn-new-line").onclick = () => { setTool("draw"); };
 document.getElementById("btn-undo").onclick = undo;
 document.getElementById("btn-redo").onclick = redo;
 
-document.getElementById("opt-grid").onchange = (e) => { state.showGrid = e.target.checked; applyView(); };
-document.getElementById("opt-snap45").onchange = (e) => { state.snap45 = e.target.checked; };
-document.getElementById("opt-linenames").onchange = (e) => { state.showLineNames = e.target.checked; renderScene(); };
-document.getElementById("opt-legend").onchange = (e) => { state.showLegend = e.target.checked; renderScene(); };
+// options-bar document toggles (custom checkboxes, replace the old <input> boxes)
+document.getElementById("opt-grid").onclick = () => { state.showGrid = !state.showGrid; toggleAttr("opt-grid", state.showGrid); applyView(); };
+document.getElementById("opt-snap").onclick = () => { state.snap45 = !state.snap45; toggleAttr("opt-snap", state.snap45); updateStatus(); };
+document.getElementById("opt-labels").onclick = () => { state.showLineNames = !state.showLineNames; toggleAttr("opt-labels", state.showLineNames); renderScene(); renderNavigator(); };
+document.getElementById("opt-legend").onclick = () => { state.showLegend = !state.showLegend; toggleAttr("opt-legend", state.showLegend); renderScene(); };
+
+// lines-panel footer
+function newLineTool() { setTool("draw"); }
+function duplicateSelectedLine() {
+  const line = state.selection && lineById(state.selection.lineId);
+  if (!line) { setTool("draw"); return; }
+  snapshot();
+  const copy = clone(line);
+  copy.id = uid();
+  copy.name = line.name + " (parallel)";
+  copy.badge = "";
+  copy.points.forEach((p) => (p.station = null));
+  const used = new Set(state.lines.map((l) => l.color));
+  copy.color = PALETTE.find((c) => !used.has(c)) || copy.color;
+  state.lines.push(copy);
+  state.selection = { lineId: copy.id };
+  renderAll();
+}
+function deleteSelectedLine() {
+  const line = state.selection && lineById(state.selection.lineId);
+  if (!line) return;
+  snapshot();
+  state.lines = state.lines.filter((l) => l.id !== line.id);
+  state.selection = null;
+  renderAll();
+}
+document.getElementById("btn-new-line").onclick = newLineTool;
+document.getElementById("btn-dup-line").onclick = duplicateSelectedLine;
+document.getElementById("btn-del-line").onclick = deleteSelectedLine;
+
+// menu-bar dropdowns: Edit / View / Line / Window
+setupMenu("btn-edit", "edit-menu", (act) => { if (act === "undo") undo(); else if (act === "redo") redo(); });
+setupMenu("btn-view", "view-menu", (act) => {
+  if (act === "grid") { state.showGrid = !state.showGrid; toggleAttr("opt-grid", state.showGrid); applyView(); }
+  else if (act === "snap") { state.snap45 = !state.snap45; toggleAttr("opt-snap", state.snap45); updateStatus(); }
+  else if (act === "labels") { state.showLineNames = !state.showLineNames; toggleAttr("opt-labels", state.showLineNames); renderScene(); renderNavigator(); }
+  else if (act === "legend") { state.showLegend = !state.showLegend; toggleAttr("opt-legend", state.showLegend); renderScene(); }
+  else if (act === "fit") fitView();
+});
+setupMenu("btn-line", "line-menu", (act) => {
+  if (act === "newline") newLineTool();
+  else if (act === "duplicate") duplicateSelectedLine();
+  else if (act === "delline") deleteSelectedLine();
+});
+setupMenu("btn-window", "window-menu", (act) => {
+  if (act === "navigator") { ui.showNav = !ui.showNav; saveUI(); renderNavigator(); }
+});
+
+// live pointer readout in the status bar
+svg.addEventListener("pointermove", (e) => {
+  const w = toWorld(e.clientX, e.clientY);
+  setText("sb-pointer", `X ${Math.round(w.x)} · Y ${Math.round(w.y)}`);
+});
 
 function zoomBy(f) {
   const r = svg.getBoundingClientRect();
@@ -1668,6 +1932,8 @@ function sampleLines() {
 
 // ---------------------------------------------------------------- boot
 (function boot() {
+  loadUI();
+  applyPaper();
   const s = loadStore();
   if (!s.maps.length) {
     // migrate the old single-slot save, if any
