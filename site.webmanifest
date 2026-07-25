@@ -1,7 +1,7 @@
 {
   "name": "RouteMaker",
   "short_name": "RouteMaker",
-  "description": "Designer for beautiful JR East-style transit / rail network maps.",
+  "description": "Designer for beautiful transit / rail network maps.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
