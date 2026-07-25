@@ -1933,6 +1933,7 @@ let spaceDown = false;
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closeMenus();
+    if (!aboutModal.classList.contains("hidden")) { hideAbout(); return; }
     if (!shortcutsModal.classList.contains("hidden")) { hideShortcuts(); return; }
     const modal = document.getElementById("open-modal");
     if (!modal.classList.contains("hidden")) { modal.classList.add("hidden"); return; }
@@ -2195,8 +2196,11 @@ setupMenu("btn-line", "line-menu", (act) => {
 });
 setupMenu("btn-window", "window-menu", (act) => {
   if (act === "navigator") { ui.showNav = !ui.showNav; saveUI(); renderNavigator(); }
-  else if (act === "shortcuts") showShortcuts();
   else if (act.startsWith("accent-")) { ui.accent = ACCENTS[act.slice(7)] || ACCENTS.blue; saveUI(); applyAccent(); }
+});
+setupMenu("btn-help", "help-menu", (act) => {
+  if (act === "shortcuts") showShortcuts();
+  else if (act === "about") showAbout();
 });
 
 // live pointer readout in the status bar
@@ -2357,6 +2361,13 @@ function showShortcuts() {
 function hideShortcuts() { shortcutsModal.classList.add("hidden"); }
 document.getElementById("shortcuts-close").onclick = hideShortcuts;
 shortcutsModal.addEventListener("click", (e) => { if (e.target === shortcutsModal) hideShortcuts(); });
+
+// ---------------------------------------------------------------- about dialog
+const aboutModal = document.getElementById("about-modal");
+function showAbout() { aboutModal.classList.remove("hidden"); }
+function hideAbout() { aboutModal.classList.add("hidden"); }
+document.getElementById("about-close").onclick = hideAbout;
+aboutModal.addEventListener("click", (e) => { if (e.target === aboutModal) hideAbout(); });
 
 document.getElementById("map-name").addEventListener("input", autosave);
 document.getElementById("map-name").addEventListener("keydown", (e) => {
