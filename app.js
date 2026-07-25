@@ -1081,23 +1081,18 @@ function renderLineList() {
 
     const row = document.createElement("div");
     row.className = "ln-row" + (selected ? " selected" : "");
-    row.draggable = true;
-    row.onclick = () => { state.selection = { lineId: line.id }; renderAll(); };
-    row.ondragstart = (e) => { e.dataTransfer.setData("text/plain", String(idx)); e.dataTransfer.effectAllowed = "move"; row.classList.add("dragging"); };
-    row.ondragend = () => row.classList.remove("dragging");
-    row.ondragover = (e) => { e.preventDefault(); row.classList.add("drag-over"); };
-    row.ondragleave = () => row.classList.remove("drag-over");
-    row.ondrop = (e) => {
-      e.preventDefault(); row.classList.remove("drag-over");
-      const from = +e.dataTransfer.getData("text/plain");
-      if (Number.isNaN(from) || from === idx) return;
-      snapshot("Reorder lines");
-      const [moved] = state.lines.splice(from, 1);
-      state.lines.splice(idx, 0, moved);
-      renderAll();
-    };
+    // tap body to select; tap the name of an already-selected line to rename
+    row.addEventListener("click", (e) => {
+      if (e.target.closest(".ln-grip,.ln-eye,.ln-lock,.ln-rename")) return;
+      if (selected && e.target.closest(".ln-name")) { startInlineRename(text, nm, line); return; }
+      state.selection = { lineId: line.id }; renderAll();
+    });
 
     const bar = document.createElement("div"); bar.className = "ln-bar";
+
+    const grip = document.createElement("div");
+    grip.className = "ln-grip"; grip.textContent = "⠿"; grip.title = "Drag to reorder (z-order)";
+    grip.addEventListener("pointerdown", (e) => startRowDrag(e, idx, row));
 
     const eye = document.createElement("button");
     eye.className = "ln-eye" + (hidden ? " off" : "");
@@ -1112,8 +1107,7 @@ function renderLineList() {
     const nm = document.createElement("div");
     nm.className = "ln-name" + (hidden ? " hidden-line" : "");
     nm.textContent = line.name || "(unnamed line)";
-    nm.title = "Double-click to rename";
-    nm.ondblclick = (e) => { e.stopPropagation(); startInlineRename(text, nm, line); };
+    nm.title = selected ? "Tap again to rename" : "";
     const meta = document.createElement("div");
     meta.className = "ln-meta";
     meta.textContent = `${nStops} stop${nStops === 1 ? "" : "s"}` + (line.closed ? " · loop" : "");
@@ -1124,9 +1118,42 @@ function renderLineList() {
     lock.title = line.locked ? "Unlock line" : "Lock line";
     lock.onclick = (e) => { e.stopPropagation(); line.locked = !line.locked; renderAll(); };
 
-    row.append(bar, eye, chip, text, lock);
+    row.append(bar, grip, eye, chip, text, lock);
     ul.append(row);
   });
+}
+// Pointer-based row reordering — works with mouse, touch and Pencil (grip has
+// touch-action:none so the vertical drag reorders instead of scrolling the list).
+function startRowDrag(e, idx, row) {
+  e.preventDefault(); e.stopPropagation();
+  const ul = document.getElementById("line-list");
+  const startY = e.clientY;
+  let moved = false, to = idx;
+  const onMove = (ev) => {
+    if (!moved && Math.abs(ev.clientY - startY) < 4) return;
+    moved = true; row.classList.add("dragging");
+    const rows = [...ul.children];
+    to = rows.length;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i].getBoundingClientRect();
+      if (ev.clientY < r.top + r.height / 2) { to = i; break; }
+    }
+    rows.forEach((r, i) => r.classList.toggle("drag-over", moved && i === to));
+  };
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    [...ul.children].forEach((r) => r.classList.remove("drag-over", "dragging"));
+    if (!moved) return;
+    let dst = to; if (dst > idx) dst -= 1;
+    if (dst === idx) return;
+    snapshot("Reorder lines");
+    const [m] = state.lines.splice(idx, 1);
+    state.lines.splice(dst, 0, m);
+    renderAll();
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
 }
 function startInlineRename(textEl, nm, line) {
   const inp = document.createElement("input");
