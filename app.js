@@ -131,6 +131,36 @@ function snapAngleFn(a, p, mode) {
   return { x: a.x + Math.cos(ang) * len, y: a.y + Math.sin(ang) * len };
 }
 
+// Snap a dragged point: to a nearby vertex of another line, else to grid + guides.
+function objectSnap(w, exclLine, exclIdx) {
+  const th = 8 / state.view.scale;
+  let best = null, bestD = th;
+  for (const line of state.lines) {
+    if (line.visible === false) continue;
+    for (let i = 0; i < line.points.length; i++) {
+      if (line === exclLine && i === exclIdx) continue;
+      const q = line.points[i];
+      const d = Math.hypot(w.x - q.x, w.y - q.y);
+      if (d < bestD) { bestD = d; best = { x: q.x, y: q.y }; }
+    }
+  }
+  if (best) return best;
+  let gx = snap(w.x), gy = snap(w.y);
+  for (const g of state.guides) {
+    if (g.axis === "x" && Math.abs(w.x - g.pos) < th) gx = g.pos;
+    if (g.axis === "y" && Math.abs(w.y - g.pos) < th) gy = g.pos;
+  }
+  return { x: gx, y: gy };
+}
+
+// Nearest 8-way compass key for a vector (screen coords: +y is south/down).
+function dirFromVec(dx, dy) {
+  if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return null;
+  const ang = Math.atan2(dy, dx) * 180 / Math.PI;
+  const idx = Math.round(((ang + 360) % 360) / 45) % 8;
+  return ["e", "se", "s", "sw", "w", "nw", "n", "ne"][idx];
+}
+
 function distToSegment(p, a, b) {
   const vx = b.x - a.x, vy = b.y - a.y;
   const len2 = vx * vx + vy * vy;
@@ -1505,15 +1535,13 @@ function onPointerDown(e) {
   }
   if (state.tool === "label") {
     const hit = hitTest(w);
-    if (hit && hit.type === "point") {
-      state.selection = hit.line.points[hit.index].station
-        ? { lineId: hit.line.id, pointIndex: hit.index }
-        : { lineId: hit.line.id };
+    if (hit && hit.type === "point" && hit.line.points[hit.index].station) {
+      // select the stop and arm a drag to swing its label around (8-way)
+      state.selection = { lineId: hit.line.id, pointIndex: hit.index };
+      mouse = { mode: "moveLabel", line: hit.line, index: hit.index, startClient: [e.clientX, e.clientY], moved: false };
       renderAll();
-      const nameInput = document.querySelector('#props input[type="text"]');
-      if (nameInput) { nameInput.focus(); nameInput.select(); }
     } else if (hit) {
-      state.selection = { lineId: hit.line.id };
+      state.selection = hit.type === "point" ? { lineId: hit.line.id, pointIndex: hit.index } : { lineId: hit.line.id };
       renderAll();
     }
     return;
@@ -1656,8 +1684,15 @@ function onPointerMove(e) {
     if (!mouse.moved) return;
     const w = toWorld(e.clientX, e.clientY);
     const p = mouse.line.points[mouse.index];
-    p.x = snap(w.x); p.y = snap(w.y);
+    const sn = objectSnap(w, mouse.line, mouse.index);
+    p.x = sn.x; p.y = sn.y;
     renderScene();
+  } else if (mouse.mode === "moveLabel") {
+    if (!mouse.snapshotted && mouse.moved) { snapshot("Move label"); mouse.snapshotted = true; }
+    if (!mouse.moved) return;
+    const w = toWorld(e.clientX, e.clientY);
+    const p = mouse.line.points[mouse.index], st = p.station;
+    if (st) { const d = dirFromVec(w.x - p.x, w.y - p.y); if (d) st.dir = d; renderScene(); }
   } else if (mouse.mode === "moveLine") {
     if (!mouse.snapshotted && mouse.moved) { snapshot(); mouse.snapshotted = true; }
     if (!mouse.moved) return;
@@ -1679,7 +1714,7 @@ function onPointerUp(e) {
   }
   if (!mouse) return;
   const wasClickOnEmpty = mouse.mode === "panMaybe" && !mouse.moved;
-  const mutated = (mouse.mode === "movePoint" || mouse.mode === "moveLine") && mouse.moved;
+  const mutated = (mouse.mode === "movePoint" || mouse.mode === "moveLine" || mouse.mode === "moveLabel") && mouse.moved;
   svg.classList.remove("panning");
   mouse = null;
   if (wasClickOnEmpty && state.selection) {
@@ -1775,6 +1810,12 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     e.shiftKey ? redo() : undo();
     return;
+  }
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey) {
+    const k = e.key.toLowerCase();
+    if (k === "c") { copySelection(); e.preventDefault(); return; }
+    if (k === "v") { pasteClipboard(); e.preventDefault(); return; }
+    if (k === "d") { duplicateSelectedLine(); e.preventDefault(); return; }
   }
   switch (e.key) {
     case "v": case "V": setTool("select"); break;
@@ -1961,6 +2002,25 @@ function deleteSelectedLine() {
 document.getElementById("btn-new-line").onclick = newLineTool;
 document.getElementById("btn-dup-line").onclick = duplicateSelectedLine;
 document.getElementById("btn-del-line").onclick = deleteSelectedLine;
+
+// clipboard: copy / paste / duplicate the selected line
+let clipboard = null;
+function copySelection() {
+  const line = state.selection && lineById(state.selection.lineId);
+  if (line) clipboard = clone(line);
+}
+function pasteClipboard() {
+  if (!clipboard) return;
+  snapshot("Paste line");
+  const copy = clone(clipboard);
+  copy.id = uid();
+  copy.name = clipboard.name + " copy";
+  copy.visible = true; copy.locked = false;
+  copy.points.forEach((p) => { p.x += GRID * 2; p.y += GRID * 2; });
+  state.lines.push(copy);
+  state.selection = { lineId: copy.id };
+  renderAll();
+}
 
 // menu-bar dropdowns: Edit / View / Line / Window
 setupMenu("btn-edit", "edit-menu", (act) => { if (act === "undo") undo(); else if (act === "redo") redo(); });
