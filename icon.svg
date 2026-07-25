@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="RouteMaker">
+  <defs>
+    <pattern id="rmgrid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#e4dfcf" stroke-width="2"/>
+    </pattern>
+  </defs>
+  <rect width="512" height="512" rx="114" fill="#f4f1e8"/>
+  <rect width="512" height="512" rx="114" fill="url(#rmgrid)"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="52">
+    <path d="M120 372V150H258L330 222L258 294H120" stroke="#3f74b3"/>
+    <path d="M120 294L198 372" stroke="#3f74b3"/>
+    <path d="M198 372L309 261L420 372" stroke="#c24a3b"/>
+  </g>
+  <circle cx="198" cy="372" r="28" fill="#ffffff" stroke="#141414" stroke-width="11"/>
+</svg>

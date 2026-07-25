@@ -2,7 +2,10 @@ FROM nginx:1.27-alpine
 
 # Static single-page app — no build step, just serve the files.
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY index.html style.css app.js /usr/share/nginx/html/
+COPY index.html style.css app.js site.webmanifest \
+     favicon.svg icon.svg favicon-16.png favicon-32.png \
+     apple-touch-icon.png icon-192.png icon-512.png maskable-512.png \
+     /usr/share/nginx/html/
 
 EXPOSE 80
 
