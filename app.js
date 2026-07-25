@@ -36,6 +36,7 @@ let state = {
   selection: null,     // {lineId, pointIndex?} | null
   view: { x: 40, y: 20, scale: 1 },
   showGrid: true, snap45: true, showLineNames: true, showLegend: true,
+  snapAngle: "45", gridSize: GRID, gridContrast: 55, guides: [],
 };
 let drawing = null;    // {lineId} while draw tool is placing points
 let nextId = 1;
@@ -49,6 +50,9 @@ const TOOL_META = {
   select:  { name: "Select",  hint: "Drag a point to move it · ⌥-drag or double-click a segment to add a bend" },
   draw:    { name: "Draw",    hint: "Click to place points · click the first point to close a loop · double-click to finish" },
   station: { name: "Station", hint: "Click anywhere on a line to add a station · click a station to edit it" },
+  label:   { name: "Label",   hint: "Click a station to rename it and edit its label position / angle" },
+  guides:  { name: "Guides",  hint: "Drag out of a ruler to add a guide · drop it back on the ruler to remove it" },
+  zoom:    { name: "Zoom",    hint: "Click to zoom in · ⌥-click to zoom out · double-click to fit" },
 };
 let ui = {
   showNav: true,
@@ -82,7 +86,8 @@ function el(tag, attrs = {}, text) {
   if (text != null) n.textContent = text;
   return n;
 }
-const snap = (v) => Math.round(v / GRID) * GRID;
+const gridStep = () => state.gridSize || GRID;
+const snap = (v) => Math.round(v / gridStep()) * gridStep();
 const lineById = (id) => state.lines.find((l) => l.id === id);
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const fmt = (v) => Math.round(v * 100) / 100;
@@ -105,6 +110,18 @@ function snapOcta(a, p) {
   if (ady < adx / 2) return { x: a.x + snap(dx), y: a.y };            // horizontal
   const k = snap((adx + ady) / 2);                                    // diagonal
   return { x: a.x + Math.sign(dx) * k, y: a.y + Math.sign(dy) * k };
+}
+
+// Snap p to a fixed-angle ray from a; step is 45/30/90 degrees, magnitude grid-snapped.
+function snapAngleFn(a, p, mode) {
+  if (mode === "45" || !mode) return snapOcta(a, p);
+  const dx = p.x - a.x, dy = p.y - a.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 0.01) return { x: a.x, y: a.y };
+  const step = mode === "90" ? 90 : 30;
+  const ang = Math.round(Math.atan2(dy, dx) * 180 / Math.PI / step) * step * Math.PI / 180;
+  const len = snap(dist);
+  return { x: a.x + Math.cos(ang) * len, y: a.y + Math.sin(ang) * len };
 }
 
 function distToSegment(p, a, b) {
@@ -189,23 +206,25 @@ function drawTexturedPath(g, d, line, w) {
 }
 
 // ---------------------------------------------------------------- undo/redo
-function snapshot() {
-  undoStack.push(clone(state.lines));
+function snapshot(label = "Edit") {
+  undoStack.push({ lines: clone(state.lines), label });
   if (undoStack.length > 100) undoStack.shift();
   redoStack.length = 0;
 }
 function undo() {
   if (!undoStack.length) return;
-  redoStack.push(clone(state.lines));
-  state.lines = undoStack.pop();
+  const cur = undoStack.pop();
+  redoStack.push({ lines: clone(state.lines), label: cur.label });
+  state.lines = cur.lines;
   cancelDrawing(false);
   validateSelection();
   renderAll();
 }
 function redo() {
   if (!redoStack.length) return;
-  undoStack.push(clone(state.lines));
-  state.lines = redoStack.pop();
+  const nxt = redoStack.pop();
+  undoStack.push({ lines: clone(state.lines), label: nxt.label });
+  state.lines = nxt.lines;
   validateSelection();
   renderAll();
 }
@@ -433,8 +452,16 @@ function buildPathD(pts, closed, radius, stationAt, rawPts) {
 }
 
 function stationRadius(line, st) {
+  if (st.type === "major") return line.width * 0.85 + 4.5;
   // normal stations are small white dots fully inset in the line's band
-  return st.type === "major" ? line.width * 0.85 + 4.5 : Math.max(1.6, line.width * 0.34);
+  const ms = +line.markerSize;
+  return ms ? Math.max(1.4, ms) : Math.max(1.6, line.width * 0.34);
+}
+function stationTangent(rp, i) {
+  const a = rp[Math.max(0, i - 1)], b = rp[Math.min(rp.length - 1, i + 1)];
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return [dx / len, dy / len];
 }
 
 function rawBounds() {
@@ -465,7 +492,18 @@ function buildScene(g) {
     const rp = geom.get(line.id);
     const stationAt = line.points.map((p) => !!p.station);
     const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, line.points);
-    drawTexturedPath(gLines, d, line, line.width);
+    const op = (line.opacity == null ? 100 : line.opacity) / 100;
+    const target = op < 1 ? el("g", { opacity: fmt(op) }) : gLines;
+    const casing = +line.casing || 0;
+    if (casing > 0) {
+      // paper-colored under-stroke: masks lines below, like a transit-map bridge
+      target.append(el("path", {
+        d, fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round",
+        stroke: ui.paper || "#faf7ef", "stroke-width": line.width + casing * 2,
+      }));
+    }
+    drawTexturedPath(target, d, line, line.width);
+    if (target !== gLines) gLines.append(target);
   }
 
   // ---- line names at termini
@@ -528,7 +566,8 @@ function buildScene(g) {
       if (!st) return;
       const pos = rp[i];
       const r = stationRadius(line, st);
-      if (st.type === "major") {
+      const asMajor = st.type === "major" && line.interchangeRings !== false;
+      if (asMajor) {
         const key = p.x + "," + p.y;
         const here = atCoord.get(key);
         // farthest pair of rendered positions at this map location
@@ -557,14 +596,31 @@ function buildScene(g) {
           }));
         }
       } else {
-        // hairline stroke in the line color: invisible on a solid band, but keeps
-        // the dot visible on hollow / white-cored textures
-        gStations.append(el("circle", {
-          cx: fmt(pos.x), cy: fmt(pos.y), r, fill: "#fff", stroke: line.color, "stroke-width": 1,
-        }));
+        const marker = line.marker || "dot";
+        if (marker === "ring") {
+          gStations.append(el("circle", {
+            cx: fmt(pos.x), cy: fmt(pos.y), r: fmt(r + 0.6), fill: ui.paper || "#fff",
+            stroke: line.color, "stroke-width": Math.max(1.4, line.width * 0.26),
+          }));
+        } else if (marker === "tick") {
+          const [tx, ty] = stationTangent(rp, i);
+          const nx = -ty, ny = tx, half = line.width * 0.6;
+          gStations.append(el("line", {
+            x1: fmt(pos.x - nx * half), y1: fmt(pos.y - ny * half),
+            x2: fmt(pos.x + nx * half), y2: fmt(pos.y + ny * half),
+            stroke: "#fff", "stroke-width": Math.max(1.6, r), "stroke-linecap": "round",
+          }));
+        } else {
+          // hairline stroke in the line color: invisible on a solid band, but keeps
+          // the dot visible on hollow / white-cored textures
+          gStations.append(el("circle", {
+            cx: fmt(pos.x), cy: fmt(pos.y), r, fill: "#fff", stroke: line.color, "stroke-width": 1,
+          }));
+        }
       }
       // labels clear the band edge, not just the dot
-      if (st.name) gStations.append(buildStationLabel(pos, st, st.type === "major" ? r : Math.max(r, line.width / 2)));
+      if (st.name) gStations.append(buildStationLabel(pos, st, asMajor ? r : Math.max(r, line.width / 2),
+        { size: +line.labelSize || null, halo: line.halo !== false }));
     });
   });
 
@@ -575,7 +631,7 @@ function buildScene(g) {
   }
 }
 
-function buildStationLabel(p, st, r) {
+function buildStationLabel(p, st, r, opts = {}) {
   const dir = DIRS[st.dir] || DIRS.e;
   const rot = st.rot || 0;
   const dist = r + 7;
@@ -584,7 +640,7 @@ function buildStationLabel(p, st, r) {
   const g = el("g", { transform: `translate(${fmt(p.x)},${fmt(p.y)}) rotate(${rot})` });
 
   if (st.type === "major") {
-    const fs = 13, padX = 8, h = 20;
+    const fs = opts.size ? Math.max(9, opts.size + 1.5) : 13, padX = 8, h = Math.max(20, (opts.size || 13) + 7);
     const w = measureText(st.name, fs, 700) + padX * 2;
     let x0 = ox, y0 = oy - h / 2;
     if (anchor === "end") x0 = ox - w;
@@ -598,12 +654,13 @@ function buildStationLabel(p, st, r) {
       "font-family": "Helvetica, Arial, sans-serif",
     }, st.name));
   } else {
-    g.append(el("text", {
-      x: fmt(ox), y: fmt(oy), fill: "#1c1c1c", "font-size": 11.5, "font-weight": 500,
+    const attrs = {
+      x: fmt(ox), y: fmt(oy), fill: "#1c1c1c", "font-size": opts.size || 11.5, "font-weight": 500,
       "text-anchor": anchor, "dominant-baseline": "central",
       "font-family": "Helvetica, Arial, sans-serif",
-      stroke: "#fbfaf5", "stroke-width": 2.5, "paint-order": "stroke",
-    }, st.name));
+    };
+    if (opts.halo !== false) { attrs.stroke = "#fbfaf5"; attrs["stroke-width"] = 2.5; attrs["paint-order"] = "stroke"; }
+    g.append(el("text", attrs, st.name));
   }
   return g;
 }
@@ -707,6 +764,13 @@ function renderOverlay() {
       }));
     }
   }
+  for (const gd of state.guides) {
+    const gw = 1 / state.view.scale;
+    const a = gd.axis === "y"
+      ? { x1: -100000, y1: gd.pos, x2: 100000, y2: gd.pos }
+      : { x1: gd.pos, y1: -100000, x2: gd.pos, y2: 100000 };
+    layers.overlay.append(el("line", { ...a, stroke: "#12a5c0", "stroke-width": gw, opacity: 0.85, "pointer-events": "none" }));
+  }
   if (typeof syncCanvasControls === "function") syncCanvasControls();
 }
 
@@ -744,7 +808,7 @@ function updateStatus() {
   // status bar readouts
   const nStations = stationCount();
   const nLines = state.lines.filter((l) => l.visible !== false).length;
-  setText("sb-snap", state.snap45 ? "45° snap" : "Free angle");
+  setText("sb-snap", state.snap45 ? (state.snapAngle || "45") + "° snap" : "Free angle");
   setText("sb-counts", `${nLines} line${nLines === 1 ? "" : "s"} · ${nStations} station${nStations === 1 ? "" : "s"}`);
   setText("line-stats", `${nLines} line${nLines === 1 ? "" : "s"} · ${nStations} station${nStations === 1 ? "" : "s"}`);
   setText("line-count", String(state.lines.length));
@@ -1017,35 +1081,35 @@ function buildInspectorHeader(hd, line) {
 function buildStrokeSection(line) {
   return section("stroke", "Stroke", fmt(line.width) + " pt · " + styleLabel(lineStyle(line)), (body) => {
     body.append(propSlider("Width", 3, 16, 1, line.width, (v) => v + " pt", (v) => (line.width = v)));
-    body.append(propSlider("Casing", 0, 6, 1, 0, (v) => v + " pt", () => {}, { disabled: true }));
+    body.append(propSlider("Casing", 0, 6, 0.5, +line.casing || 0, (v) => v + " pt", (v) => (line.casing = v)));
     body.append(propSlider("Corner", 0, 40, 2, lineCorner(line), (v) => v + " pt", (v) => (line.corner = v)));
-    body.append(propSlider("Opacity", 10, 100, 5, 100, (v) => v + "%", () => {}, { disabled: true }));
+    body.append(propSlider("Opacity", 10, 100, 5, line.opacity == null ? 100 : line.opacity, (v) => v + "%", (v) => (line.opacity = v)));
     body.append(propText("Badge", line.badge || "", (v) => (line.badge = v.trim()), { maxLength: 3, placeholder: "e.g. 9" }));
   });
 }
 function buildStationsSection(line) {
-  return section("stations", "Stations", "Dot", (body) => {
-    body.append(propSeg("Marker", [["dot", "Dot"], ["ring", "Ring", true], ["tick", "Tick", true]], "dot", () => {}));
-    body.append(propSlider("Size", 1.5, 8, 0.5, 3.2, (v) => v + " pt", () => {}, { disabled: true }));
-    body.append(propCheck("Interchange rings", true, () => {}, { disabled: true }));
+  const marker = line.marker || "dot";
+  return section("stations", "Stations", marker[0].toUpperCase() + marker.slice(1) + " · " + fmt(+line.markerSize || 3.2) + " pt", (body) => {
+    body.append(propSeg("Marker", [["dot", "Dot"], ["ring", "Ring"], ["tick", "Tick"]], marker, (v) => commitPick(() => (line.marker = v))));
+    body.append(propSlider("Size", 1.5, 8, 0.5, +line.markerSize || 3.2, (v) => v + " pt", (v) => (line.markerSize = v)));
+    body.append(propCheck("Interchange rings", line.interchangeRings !== false, (v) => commitPick(() => (line.interchangeRings = v))));
   });
 }
 function buildLabelsSection(line) {
-  return section("labels", "Labels", "Per station", (body) => {
-    body.append(propSlider("Size", 7, 16, 0.5, 9.5, (v) => v + " pt", () => {}, { disabled: true }));
-    body.append(propSelect("Position", [["e", "Right"], ["w", "Left"], ["n", "Above"], ["s", "Below"]], "e", () => {}));
-    body.querySelector("select").disabled = true; body.querySelector(".prow:last-child").classList.add("disabled");
-    body.append(propCheck("Halo behind text", true, () => {}, { disabled: true }));
-    const hint = elh("div", "hist-item", "Select a station point to edit its label →");
-    body.append(hint);
+  return section("labels", "Labels", (+line.labelSize || 9.5) + " pt" + (line.halo === false ? "" : " · halo"), (body) => {
+    body.append(propSlider("Size", 7, 16, 0.5, +line.labelSize || 9.5, (v) => v + " pt", (v) => (line.labelSize = v)));
+    body.append(propCheck("Halo behind text", line.halo !== false, (v) => commitPick(() => (line.halo = v))));
+    body.append(elh("div", "hist-item", "Select a station point to set its label position →"));
   });
 }
 function buildGeometrySection(line) {
   const b = lineBounds(line);
-  return section("geometry", "Geometry", state.snap45 ? "45° snap" : "Free", (body) => {
-    body.append(propSeg("Snap", [["45", "45°"], ["30", "30°", true], ["90", "90°", true], ["free", "Free"]],
-      state.snap45 ? "45" : "free",
-      (v) => { state.snap45 = (v === "45"); toggleAttr("opt-snap", state.snap45); renderProps(); updateStatus(); }));
+  const cur = state.snap45 ? (state.snapAngle || "45") : "free";
+  return section("geometry", "Geometry", state.snap45 ? (state.snapAngle || "45") + "° snap" : "Free", (body) => {
+    body.append(propSeg("Snap", [["45", "45°"], ["30", "30°"], ["90", "90°"], ["free", "Free"]], cur, (v) => {
+      if (v === "free") state.snap45 = false; else { state.snap45 = true; state.snapAngle = v; }
+      toggleAttr("opt-snap", state.snap45); renderProps(); updateStatus();
+    }));
     const bg = elh("div", "bounds-grid");
     bg.append(elh("span", "bl", "X"), elh("span", "bv", Math.round(b.x)),
               elh("span", "bl", "Y"), elh("span", "bv", Math.round(b.y)),
@@ -1057,9 +1121,9 @@ function buildGeometrySection(line) {
   });
 }
 function buildDocumentSection() {
-  return section("document", "Document", GRID + " pt grid", (body) => {
-    body.append(propSlider("Grid", 8, 64, 1, GRID, (v) => v + " pt", () => {}, { disabled: true }));
-    body.append(propSlider("Contrast", 0, 100, 5, 55, (v) => v + "%", () => {}, { disabled: true }));
+  return section("document", "Document", (state.gridSize || GRID) + " pt grid", (body) => {
+    body.append(propSlider("Grid", 8, 64, 1, state.gridSize || GRID, (v) => v + " pt", (v) => { state.gridSize = v; applyGrid(); }));
+    body.append(propSlider("Contrast", 0, 100, 5, state.gridContrast == null ? 55 : state.gridContrast, (v) => v + "%", (v) => { state.gridContrast = v; applyGrid(); }));
     const row = elh("div", "prow"); row.append(elh("span", "prow-lab", "Paper"));
     const strip = elh("div", "paper-strip");
     for (const c of PAPER_STOCKS) {
@@ -1075,7 +1139,7 @@ function buildHistorySection() {
   return section("history", "History", n + " step" + (n === 1 ? "" : "s"), (body) => {
     const list = elh("div", "hist-list");
     list.append(elh("div", "hist-item current", "● Current state"));
-    for (let i = 0; i < Math.min(n, 8); i++) list.append(elh("div", "hist-item", "Edit " + (n - i)));
+    for (const entry of undoStack.slice(-8).reverse()) list.append(elh("div", "hist-item", entry.label || "Edit"));
     if (!n) list.append(elh("div", "hist-item", "No history yet"));
     body.append(list);
   });
@@ -1117,6 +1181,19 @@ function applyPaper() {
   const p = document.querySelector(".tr-paper");
   if (p) p.style.background = ui.paper;
 }
+function applyGrid() {
+  const gs = state.gridSize || GRID;
+  const op = fmt((state.gridContrast == null ? 55 : state.gridContrast) / 100);
+  for (const [id, size] of [["gridpat", gs], ["gridpat-mid", gs * 5], ["gridpat-major", gs * 10]]) {
+    const pat = document.getElementById(id);
+    if (!pat) continue;
+    pat.setAttribute("width", size); pat.setAttribute("height", size);
+    const rect = pat.querySelector("rect");
+    if (rect) { rect.setAttribute("width", size); rect.setAttribute("height", size); }
+    const path = pat.querySelector("path");
+    if (path) { path.setAttribute("d", `M ${size} 0 L 0 0 0 ${size}`); path.setAttribute("stroke-opacity", op); }
+  }
+}
 
 // ---------------------------------------------------------------- hit testing
 // Tests against rendered (corridor-offset) geometry so clicks land on the
@@ -1157,11 +1234,11 @@ function setTool(t) {
   if (!TOOL_META[t]) return; // ignore inert tools (label/guides/zoom)
   state.tool = t;
   if (t !== "draw") finishDrawing();
-  const ids = { select: "tool-select", draw: "tool-draw", station: "tool-station" };
+  const ids = { select: "tool-select", draw: "tool-draw", station: "tool-station", label: "tool-label", guides: "tool-guides", zoom: "tool-zoom" };
   for (const [tool, id] of Object.entries(ids)) {
-    document.getElementById(id).classList.toggle("active", t === tool);
+    const b = document.getElementById(id); if (b) b.classList.toggle("active", t === tool);
   }
-  svg.classList.toggle("tool-draw", t === "draw" || t === "station");
+  svg.classList.toggle("tool-draw", t === "draw" || t === "station" || t === "label" || t === "zoom");
   // options-bar tool glyph mirrors the active rail button; name from metadata
   const railBtn = document.getElementById(ids[t]);
   const glyph = document.getElementById("ob-tool-glyph");
@@ -1187,7 +1264,7 @@ function startLine() {
 
 function drawSnap(line, w) {
   const pts = line.points;
-  if (pts.length && state.snap45) return snapOcta(pts[pts.length - 1], w);
+  if (pts.length && state.snap45) return snapAngleFn(pts[pts.length - 1], w, state.snapAngle);
   return { x: snap(w.x), y: snap(w.y) };
 }
 
@@ -1266,6 +1343,26 @@ function onPointerDown(e) {
   }
 
   const w = toWorld(e.clientX, e.clientY);
+
+  if (state.tool === "zoom") {
+    zoomAt(e.clientX, e.clientY, e.altKey ? 1 / 1.35 : 1.35);
+    return;
+  }
+  if (state.tool === "label") {
+    const hit = hitTest(w);
+    if (hit && hit.type === "point") {
+      state.selection = hit.line.points[hit.index].station
+        ? { lineId: hit.line.id, pointIndex: hit.index }
+        : { lineId: hit.line.id };
+      renderAll();
+      const nameInput = document.querySelector('#props input[type="text"]');
+      if (nameInput) { nameInput.focus(); nameInput.select(); }
+    } else if (hit) {
+      state.selection = { lineId: hit.line.id };
+      renderAll();
+    }
+    return;
+  }
 
   if (state.tool === "draw") {
     let line = drawing ? lineById(drawing.lineId) : null;
@@ -1449,6 +1546,7 @@ function activateDouble(clientX, clientY) {
   lastDoubleAt = performance.now();
   const w = toWorld(clientX, clientY);
   if (state.tool === "draw") { finishDrawing(); return; }
+  if (state.tool === "zoom") { fitView(); return; }
   const hit = hitTest(w);
   if (hit && hit.type === "point") {
     const p = hit.line.points[hit.index];
@@ -1525,6 +1623,8 @@ window.addEventListener("keydown", (e) => {
   switch (e.key) {
     case "v": case "V": setTool("select"); break;
     case "d": case "D": setTool("draw"); break;
+    case "t": case "T": setTool("label"); break;
+    case "z": case "Z": setTool("zoom"); break;
     case "Enter":
       if (drawing) finishDrawing();
       break;
@@ -1569,11 +1669,7 @@ window.addEventListener("keydown", (e) => {
       }
       break;
     }
-    case "g": case "G":
-      state.showGrid = !state.showGrid;
-      toggleAttr("opt-grid", state.showGrid);
-      applyView();
-      break;
+    case "g": case "G": setTool("guides"); break;
   }
 });
 window.addEventListener("keyup", (e) => {
@@ -1654,6 +1750,9 @@ function exportJSONFile() {
 document.getElementById("tool-select").onclick = () => setTool("select");
 document.getElementById("tool-draw").onclick = () => setTool("draw");
 document.getElementById("tool-station").onclick = () => setTool("station");
+document.getElementById("tool-label").onclick = () => setTool("label");
+document.getElementById("tool-guides").onclick = () => setTool("guides");
+document.getElementById("tool-zoom").onclick = () => setTool("zoom");
 document.getElementById("btn-undo").onclick = undo;
 document.getElementById("btn-redo").onclick = redo;
 
@@ -1716,9 +1815,34 @@ svg.addEventListener("pointermove", (e) => {
   setText("sb-pointer", `X ${Math.round(w.x)} · Y ${Math.round(w.y)}`);
 });
 
+// guides: drag out of a ruler to create one; drop it back on the ruler to remove it
+function startGuideDrag(axis, e) {
+  e.preventDefault();
+  const at = (ev) => (axis === "y" ? toWorld(ev.clientX, ev.clientY).y : toWorld(ev.clientX, ev.clientY).x);
+  const g = { axis, pos: at(e) };
+  state.guides.push(g);
+  renderOverlay();
+  const move = (ev) => { g.pos = at(ev); renderOverlay(); };
+  const up = (ev) => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    const r = svg.getBoundingClientRect();
+    const backOnRuler = axis === "y" ? ev.clientY < r.top + 2 : ev.clientX < r.left + 2;
+    if (backOnRuler) { state.guides = state.guides.filter((x) => x !== g); renderOverlay(); }
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+document.querySelector(".ruler-h").addEventListener("pointerdown", (e) => startGuideDrag("y", e));
+document.querySelector(".ruler-v").addEventListener("pointerdown", (e) => startGuideDrag("x", e));
+
 function zoomBy(f) {
   const r = svg.getBoundingClientRect();
-  const mx = r.width / 2, my = r.height / 2;
+  zoomAt(r.left + r.width / 2, r.top + r.height / 2, f);
+}
+function zoomAt(clientX, clientY, f) {
+  const r = svg.getBoundingClientRect();
+  const mx = clientX - r.left, my = clientY - r.top;
   const s0 = state.view.scale, s1 = Math.min(4, Math.max(0.15, s0 * f));
   state.view.x = mx - ((mx - state.view.x) / s0) * s1;
   state.view.y = my - ((my - state.view.y) / s0) * s1;
@@ -1934,6 +2058,7 @@ function sampleLines() {
 (function boot() {
   loadUI();
   applyPaper();
+  applyGrid();
   const s = loadStore();
   if (!s.maps.length) {
     // migrate the old single-slot save, if any
