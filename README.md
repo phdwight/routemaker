@@ -108,20 +108,41 @@ local maps.
 
 ## Deployment & CI
 
-- **GitHub Actions** ([`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml))
-  builds and publishes the image to `ghcr.io/phdwight/routemaker` on every merge.
-- Images are **multi-arch** (`linux/amd64` + `linux/arm64`), lean (the Dockerfile
-  copies only the app files), and **secret-scanned** in CI.
-- The build runs **only when image-affecting files change** (`app.js`, `index.html`,
-  `style.css`, `nginx.conf`, `Dockerfile`, `.dockerignore`, or the workflow itself) —
-  a docs-only change like editing this README does not rebuild or republish the image.
-- `:latest` tracks the `main` branch; `develop` publishes a `:develop` tag.
+One GitHub Actions workflow
+([`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml))
+keeps the **app version, git tag, and container image tag in lockstep**, updated
+automatically on every merge to `main`. It runs three jobs:
+
+1. **test** — lint/validate (`node --check app.js`, manifest JSON, semver `VERSION`).
+2. **bump** (main only) — version sync is **tag-driven**: the next version is
+   `max(latest tag's patch + 1, committed VERSION floor)`, seeded from `VERSION` for
+   the first release (`1.0.0`). It pushes the annotated tag `vX.Y.Z` onto the merge
+   commit. Only a **tag** is pushed — no commit to protected `main`.
+3. **build & publish** — checks out the bump's commit, **bakes the resolved version
+   into the image's `VERSION`**, and publishes multi-arch (`amd64` + `arm64`) images
+   tagged `:X.Y.Z` **and** `:latest`. It then verifies the `VERSION` inside the image
+   matches the tag exactly, and secret-scans the image.
+
+Because the app fetches `/VERSION` at runtime, the running app always reports the same
+version as its image tag and git tag. `develop` publishes a `:develop` tag (no bump).
+The build runs only when image-affecting files change (docs-only edits don't republish).
+
+**Versioning knobs**
+
+- **Patch** bumps happen automatically on each merge to `main`.
+- For a **minor/major** release, raise the floor by editing `VERSION` (e.g. `1.1.0`)
+  on `develop` before merging — the next release uses it.
+- **Cut a GitHub release** on an existing tag (the merge already created it):
+  `gh release create vX.Y.Z --notes "…"` — never let it create a new tag.
+- The in-app version is shown in **Help → About RouteMaker**.
 
 ## Files
 
 - `index.html` — layout and SVG canvas
 - `style.css` — dark editor UI
 - `app.js` — state, rendering, tools, export
+- `VERSION` — semver seed/floor; the authoritative version is the latest git tag,
+  baked into the image and shown in Help → About
 - `Dockerfile` — nginx image that serves the app
 - `nginx.conf` — static-file server config (gzip, caching)
 - `docker-compose.yml` — standalone, pulls the published image
