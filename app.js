@@ -2364,6 +2364,17 @@ shortcutsModal.addEventListener("click", (e) => { if (e.target === shortcutsModa
 
 // ---------------------------------------------------------------- about dialog
 const aboutModal = document.getElementById("about-modal");
+// Version shown in About comes from the VERSION file shipped in the image, so the
+// running app always reports exactly the published version.
+let appVersion = "";
+fetch("VERSION", { cache: "no-store" })
+  .then((r) => (r.ok ? r.text() : ""))
+  .then((v) => {
+    appVersion = (v || "").trim();
+    const el = document.getElementById("about-version");
+    if (el) el.textContent = appVersion ? "v" + appVersion : "dev";
+  })
+  .catch(() => {});
 function showAbout() { aboutModal.classList.remove("hidden"); }
 function hideAbout() { aboutModal.classList.add("hidden"); }
 document.getElementById("about-close").onclick = hideAbout;
