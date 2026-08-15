@@ -218,6 +218,16 @@ function darken(hex, f = 0.62) {
   return "#" + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
 }
 
+// same hue mixed toward white — pattern marks read as an imprint on the band
+function lighten(hex, f = 0.45) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return "#fff";
+  const n = parseInt(m[1], 16);
+  const mix = (v) => Math.round(v + (255 - v) * f);
+  const r = mix((n >> 16) & 255), g = mix((n >> 8) & 255), b = mix(n & 255);
+  return "#" + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
+}
+
 // ---- direction-following ornaments (hatch / zigzag / wave / chevron / crosshatch / rail)
 // Marks are placed ALONG the centre-line and oriented to the local tangent, so the
 // texture reads the same on horizontal, vertical and diagonal segments alike.
@@ -263,10 +273,10 @@ function oscPath(rp, closed, amp, wavelen, kind) {
   return pts.length ? "M" + pts.join(" L") : "M0 0";
 }
 
-// Draws the white marks for a mark-based texture on top of the coloured band.
-function drawOrnaments(g, rp, closed, style, w) {
+// Draws the imprint marks for a mark-based texture on top of the coloured band.
+function drawOrnaments(g, rp, closed, style, w, ink) {
   if (!rp || rp.length < 2) return;
-  const white = "rgba(255,255,255,0.92)";
+  const white = ink || "rgba(255,255,255,0.92)";
   const half = w * 0.42, sw = Math.max(1.2, w * 0.16);
   const line2 = (x1, y1, x2, y2) => g.append(el("line", { x1: fmt(x1), y1: fmt(y1), x2: fmt(x2), y2: fmt(y2), stroke: white, "stroke-width": sw, "stroke-linecap": "round" }));
   if (style === "wave" || style === "zigzag") {
@@ -341,14 +351,17 @@ function ensurePattern(kind, color) {
 // rp/closed are the rendered polyline points, needed for direction-following textures.
 function drawTexturedPath(g, d, line, w, rp, closed) {
   const color = line.color, style = lineStyle(line);
+  const ink = lighten(color);   // pattern marks: same hue, lighter — an imprint, never the paper
   const push = (attrs) => g.append(el("path", Object.assign(
     { d, fill: "none", "stroke-linejoin": "round", "stroke-linecap": "round" }, attrs)));
   switch (style) {
     case "dashed":
-      push({ stroke: color, "stroke-width": w, "stroke-dasharray": `${w * 1.8} ${w * 1.1}`, "stroke-linecap": "butt" });
+      push({ stroke: color, "stroke-width": w });
+      push({ stroke: ink, "stroke-width": w, "stroke-dasharray": `${w * 1.1} ${w * 1.8}`, "stroke-linecap": "butt" });
       break;
     case "dotted":
-      push({ stroke: color, "stroke-width": w, "stroke-dasharray": `0.1 ${w * 1.7}` });
+      push({ stroke: color, "stroke-width": w });
+      push({ stroke: ink, "stroke-width": w * 0.55, "stroke-dasharray": `0.1 ${w * 1.5}` });
       break;
     case "hatch":
     case "zigzag":
@@ -356,11 +369,12 @@ function drawTexturedPath(g, d, line, w, rp, closed) {
     case "chevron":
     case "crosshatch":
     case "rail":
-      push({ stroke: color, "stroke-width": w });   // coloured band
-      drawOrnaments(g, rp, closed, style, w);        // white marks that follow the line
+      push({ stroke: color, "stroke-width": w });     // coloured band
+      drawOrnaments(g, rp, closed, style, w, ink);     // imprint marks that follow the line
       break;
     case "dashdot":
-      push({ stroke: color, "stroke-width": w, "stroke-dasharray": `${w * 2.2} ${w} 0.1 ${w}`, "stroke-linecap": "round" });
+      push({ stroke: color, "stroke-width": w });
+      push({ stroke: ink, "stroke-width": w * 0.55, "stroke-dasharray": `${w * 2.2} ${w} 0.1 ${w}`, "stroke-linecap": "round" });
       break;
     case "edged":
       push({ stroke: darken(color), "stroke-width": w + 3.5 });
@@ -370,14 +384,14 @@ function drawTexturedPath(g, d, line, w, rp, closed) {
       push({ stroke: color, "stroke-width": w });
   }
   if (style === "stripe") {
-    push({ stroke: "#fff", "stroke-width": Math.max(1.4, w * 0.42),
+    push({ stroke: ink, "stroke-width": Math.max(1.4, w * 0.42),
            "stroke-dasharray": `${w * 0.9} ${w * 0.9}`, "stroke-linecap": "butt" });
   } else if (style === "hollow") {
-    push({ stroke: "#fff", "stroke-width": Math.max(1.5, w - 4.5) });
+    push({ stroke: ink, "stroke-width": Math.max(1.5, w - 4.5) });
   } else if (style === "double") {
-    push({ stroke: "#fbfaf5", "stroke-width": Math.max(1.5, w * 0.45), "stroke-linecap": "butt" });
+    push({ stroke: ink, "stroke-width": Math.max(1.5, w * 0.45), "stroke-linecap": "butt" });
   } else if (style === "broken") {
-    push({ stroke: "#fff", "stroke-width": w, "stroke-dasharray": `2.2 ${w * 1.9}`, "stroke-linecap": "butt" });
+    push({ stroke: ink, "stroke-width": w, "stroke-dasharray": `2.2 ${w * 1.9}`, "stroke-linecap": "butt" });
   }
 }
 
@@ -506,10 +520,43 @@ function parseMapFile(json) {
 }
 
 // ---------------------------------------------------------------- geometry
-// Segments shared by several lines (same two grid points) fan out into
-// parallel tracks. Returns Map lineId -> rendered points.
+// Lines that run through the same corridor — sharing the exact same points OR
+// simply hand-drawn parallel within about a grid step of each other — fan out
+// into evenly spaced tracks around the corridor's centerline, preserving the
+// drawn left/right arrangement. Returns Map lineId -> rendered points; the
+// centerline geometry and bundle half-width per vertex are cached so
+// buildPathD can keep corner arcs concentric across the whole bundle.
+let centerCache = new Map(), haloCache = new Map();
+
+// intersect each vertex's two adjacent offset segments (miter join)
+function miterOffsets(line, pts, off) {
+  const n = pts.length, out = [];
+  for (let i = 0; i < n; i++) {
+    const p = pts[i];
+    const inSeg = line.closed ? (i - 1 + n) % n : i > 0 ? i - 1 : null;
+    const outSeg = line.closed ? i : i < n - 1 ? i : null;
+    if (inSeg == null && outSeg == null) { out.push({ x: p.x, y: p.y }); continue; }
+    if (inSeg == null) { out.push({ x: p.x + off[outSeg].x, y: p.y + off[outSeg].y }); continue; }
+    if (outSeg == null) { out.push({ x: p.x + off[inSeg].x, y: p.y + off[inSeg].y }); continue; }
+    const o1 = off[inSeg], o2 = off[outSeg];
+    if (o1.x === o2.x && o1.y === o2.y) { out.push({ x: p.x + o1.x, y: p.y + o1.y }); continue; }
+    const a = pts[(i - 1 + n) % n], b = pts[(i + 1) % n];
+    const d1 = { x: p.x - a.x, y: p.y - a.y }, d2 = { x: b.x - p.x, y: b.y - p.y };
+    const cross = d1.x * d2.y - d1.y * d2.x;
+    if (Math.abs(cross) < 1e-6) {
+      out.push({ x: p.x + (o1.x + o2.x) / 2, y: p.y + (o1.y + o2.y) / 2 });
+    } else {
+      const ax = a.x + o1.x, ay = a.y + o1.y;
+      const bx = p.x + o2.x, by = p.y + o2.y;
+      const t = ((bx - ax) * d2.y - (by - ay) * d2.x) / cross;
+      out.push({ x: ax + t * d1.x, y: ay + t * d1.y });
+    }
+  }
+  return out;
+}
+
 function computeGeometry() {
-  const groups = new Map(); // canonical segment key -> {ux,uy,members:[{li,i,width}]}
+  const segs = [];
   state.lines.forEach((line, li) => {
     const pts = line.points, n = pts.length;
     const segCount = line.closed ? n : n - 1;
@@ -518,61 +565,85 @@ function computeGeometry() {
       if (a.x === b.x && a.y === b.y) continue;
       const swapped = b.x < a.x || (b.x === a.x && b.y < a.y);
       const p = swapped ? b : a, q = swapped ? a : b;
-      const key = p.x + "," + p.y + "|" + q.x + "," + q.y;
-      if (!groups.has(key)) {
-        const len = Math.hypot(q.x - p.x, q.y - p.y);
-        groups.set(key, { ux: -(q.y - p.y) / len, uy: (q.x - p.x) / len, members: [] });
-      }
-      // sign: does this line travel the segment along canonical order or against it?
-      groups.get(key).members.push({ li, i, width: line.width, sign: swapped ? -1 : 1 });
+      const len = Math.hypot(q.x - p.x, q.y - p.y);
+      const dx = (q.x - p.x) / len, dy = (q.y - p.y) / len; // canonical direction
+      const nx = -dy, ny = dx;                              // canonical normal
+      segs.push({
+        li, i, width: line.width, sign: swapped ? -1 : 1, dx, dy, nx, ny,
+        perp: p.x * nx + p.y * ny,                          // lateral position
+        s0: p.x * dx + p.y * dy, s1: q.x * dx + q.y * dy,   // span along direction
+      });
     }
   });
 
-  // per-line, per-segment perpendicular offset vectors. Offsets are oriented by
-  // each line's direction of travel (sign) so a track stays on the same side
-  // through corners instead of swapping and crossing its neighbor.
-  const offsets = state.lines.map((l) => l.points.map(() => ({ x: 0, y: 0 })));
-  for (const { ux, uy, members } of groups.values()) {
+  // union-find: segments of different lines running parallel within about a
+  // grid step of each other, overlapping along their length, share a corridor
+  const par = segs.map((_, j) => j);
+  const find = (j) => { while (par[j] !== j) j = par[j] = par[par[j]]; return j; };
+  for (let j = 0; j < segs.length; j++) {
+    for (let k = j + 1; k < segs.length; k++) {
+      const A = segs[j], B = segs[k];
+      if (A.li === B.li) continue;
+      if (Math.abs(A.dx * B.dy - A.dy * B.dx) > 0.02) continue;                       // not parallel
+      if (Math.abs(A.perp - B.perp) > (A.width + B.width) / 2 + gridStep()) continue; // too far apart
+      if (Math.min(A.s1, B.s1) - Math.max(A.s0, B.s0) < 0.5) continue;                // no shared span
+      const rj = find(j), rk = find(k);
+      if (rj !== rk) par[rj] = rk;
+    }
+  }
+
+  const zero = () => ({ x: 0, y: 0 });
+  const offSlot = state.lines.map((l) => l.points.map(zero));   // raw -> own track
+  const offCenter = state.lines.map((l) => l.points.map(zero)); // raw -> bundle centerline
+  const segHalf = state.lines.map((l) => l.points.map(() => 0));
+
+  const groups = new Map();
+  segs.forEach((s, j) => {
+    const r = find(j);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(s);
+  });
+  for (const members of groups.values()) {
     if (members.length < 2) continue;
-    members.sort((A, B) => A.li - B.li);
-    const spacing = Math.max(...members.map((M) => M.width)) + CORRIDOR_GAP;
-    let lat = members.map((M, k) => (k - (members.length - 1) / 2) * spacing * M.sign);
-    // lines traveling opposite ways can land on the same slot — fall back to
-    // plain world-frame slots so tracks at least never overlap
-    if (new Set(lat.map((v) => Math.round(v * 8))).size !== lat.length)
-      lat = members.map((_, k) => (k - (members.length - 1) / 2) * spacing);
-    members.forEach((M, k) => {
-      offsets[M.li][M.i] = { x: ux * lat[k], y: uy * lat[k] };
+    // one track per line per lateral position (a line U-turning through the
+    // corridor contributes two independent tracks)
+    const tracks = new Map();
+    for (const s of members) {
+      const key = s.li + ":" + Math.round(s.perp / Math.max(1, gridStep() / 2));
+      if (!tracks.has(key)) tracks.set(key, { li: s.li, sign: s.sign, width: s.width, sum: 0, n: 0, segs: [] });
+      const t = tracks.get(key);
+      t.sum += s.perp; t.n++; t.segs.push(s);
+    }
+    const list = [...tracks.values()].map((t) => ({ ...t, perp: t.sum / t.n }));
+    if (list.length < 2) continue;
+    // the drawn arrangement decides the slot order; coincident tracks
+    // tie-break in the travel frame so each holds its side through corners
+    // instead of swapping and crossing its neighbor
+    list.sort((a, b) => (Math.abs(a.perp - b.perp) > 0.5 ? a.perp - b.perp : a.sign * a.li - b.sign * b.li));
+    const spacing = Math.max(...list.map((t) => t.width)) + CORRIDOR_GAP;
+    const center = list.reduce((t, e) => t + e.perp, 0) / list.length;
+    const halfW = ((list.length - 1) / 2) * spacing;
+    list.forEach((t, r) => {
+      const target = center + (r - (list.length - 1) / 2) * spacing;
+      for (const s of t.segs) {
+        offSlot[s.li][s.i] = { x: s.nx * (target - s.perp), y: s.ny * (target - s.perp) };
+        offCenter[s.li][s.i] = { x: s.nx * (center - s.perp), y: s.ny * (center - s.perp) };
+        segHalf[s.li][s.i] = halfW;
+      }
     });
   }
 
-  // rendered vertices: intersect the two adjacent offset segments (miter)
   const geom = new Map();
+  centerCache = new Map(); haloCache = new Map();
   state.lines.forEach((line, li) => {
-    const pts = line.points, n = pts.length, off = offsets[li];
-    const out = [];
-    for (let i = 0; i < n; i++) {
-      const p = pts[i];
+    geom.set(line.id, miterOffsets(line, line.points, offSlot[li]));
+    centerCache.set(line.id, miterOffsets(line, line.points, offCenter[li]));
+    const n = line.points.length;
+    haloCache.set(line.id, line.points.map((_, i) => {
       const inSeg = line.closed ? (i - 1 + n) % n : i > 0 ? i - 1 : null;
       const outSeg = line.closed ? i : i < n - 1 ? i : null;
-      if (inSeg == null && outSeg == null) { out.push({ x: p.x, y: p.y }); continue; }
-      if (inSeg == null) { out.push({ x: p.x + off[outSeg].x, y: p.y + off[outSeg].y }); continue; }
-      if (outSeg == null) { out.push({ x: p.x + off[inSeg].x, y: p.y + off[inSeg].y }); continue; }
-      const o1 = off[inSeg], o2 = off[outSeg];
-      if (o1.x === o2.x && o1.y === o2.y) { out.push({ x: p.x + o1.x, y: p.y + o1.y }); continue; }
-      const a = pts[(i - 1 + n) % n], b = pts[(i + 1) % n];
-      const d1 = { x: p.x - a.x, y: p.y - a.y }, d2 = { x: b.x - p.x, y: b.y - p.y };
-      const cross = d1.x * d2.y - d1.y * d2.x;
-      if (Math.abs(cross) < 1e-6) {
-        out.push({ x: p.x + (o1.x + o2.x) / 2, y: p.y + (o1.y + o2.y) / 2 });
-      } else {
-        const ax = a.x + o1.x, ay = a.y + o1.y;
-        const bx = p.x + o2.x, by = p.y + o2.y;
-        const t = ((bx - ax) * d2.y - (by - ay) * d2.x) / cross;
-        out.push({ x: ax + t * d1.x, y: ay + t * d1.y });
-      }
-    }
-    geom.set(line.id, out);
+      return Math.max(inSeg == null ? 0 : segHalf[li][inSeg], outSeg == null ? 0 : segHalf[li][outSeg]);
+    }));
   });
   return geom;
 }
@@ -586,38 +657,52 @@ function pathFrom(points, closed) {
 }
 
 // path with rounded corners; vertices holding stations stay sharp so the
-// station dot sits exactly on the line. rawPts (the unoffset editable points)
+// station dot sits exactly on the line. refPts (the bundle-centerline points)
 // let corridor tracks compensate their radius so parallel turns stay
-// concentric — the inner track curves tighter, the outer wider.
-function buildPathD(pts, closed, radius, stationAt, rawPts) {
+// concentric — the inner track curves tighter, the outer wider — and halo
+// (bundle half-width per vertex) raises the base radius when a corner is too
+// tight to fit the whole bundle concentrically. Corners are true circular
+// arcs: concentric fillets keep a constant gap through a bend, which
+// quadratic Béziers cannot.
+function buildPathD(pts, closed, radius, stationAt, refPts, halo) {
   const n = pts.length;
   if (n < 2) return "";
   if (!radius || n === 2) return pathFrom(pts, closed);
   const P = (i) => pts[((i % n) + n) % n];
   const S = (i) => stationAt[((i % n) + n) % n];
-  const radiusAt = (i) => {
-    if (!rawPts) return radius;
-    const raw = rawPts[((i % n) + n) % n];
-    const p = P(i), a = P(i - 1), b = P(i + 1);
-    const l1 = Math.hypot(p.x - a.x, p.y - a.y) || 1, l2 = Math.hypot(b.x - p.x, b.y - p.y) || 1;
-    const u1 = { x: (p.x - a.x) / l1, y: (p.y - a.y) / l1 };
-    const u2 = { x: (b.x - p.x) / l2, y: (b.y - p.y) / l2 };
-    const cx = u2.x - u1.x, cy = u2.y - u1.y;   // bisector toward the turn's center
-    const cl = Math.hypot(cx, cy);
-    if (cl < 0.3) return radius;                 // straight-through / jog: no turn
-    const shift = ((p.x - raw.x) * cx + (p.y - raw.y) * cy) / cl;
-    return Math.max(2, radius - shift);
-  };
   const d = [];
   const corner = (i) => {
     const p = P(i), a = P(i - 1), b = P(i + 1);
-    const r1 = Math.hypot(p.x - a.x, p.y - a.y), r2 = Math.hypot(p.x - b.x, p.y - b.y);
-    const r = Math.min(radiusAt(i), r1 * 0.5, r2 * 0.5);
-    if (S(i) || r < 0.5 || r1 < 0.01 || r2 < 0.01) { d.push("L" + fmt(p.x) + " " + fmt(p.y)); return; }
-    const e1 = { x: p.x + ((a.x - p.x) / r1) * r, y: p.y + ((a.y - p.y) / r1) * r };
-    const e2 = { x: p.x + ((b.x - p.x) / r2) * r, y: p.y + ((b.y - p.y) / r2) * r };
+    const l1 = Math.hypot(p.x - a.x, p.y - a.y), l2 = Math.hypot(b.x - p.x, b.y - p.y);
+    if (S(i) || l1 < 0.01 || l2 < 0.01) { d.push("L" + fmt(p.x) + " " + fmt(p.y)); return; }
+    const u1 = { x: (p.x - a.x) / l1, y: (p.y - a.y) / l1 };
+    const u2 = { x: (b.x - p.x) / l2, y: (b.y - p.y) / l2 };
+    const cx = u2.x - u1.x, cy = u2.y - u1.y;      // bisector toward the turn's center
+    const sinH = Math.min(1, Math.hypot(cx, cy) / 2);           // sin(turn/2)
+    const cosH = Math.sqrt(Math.max(0, 1 - sinH * sinH));
+    if (sinH < 0.03 || cosH < 0.05) { d.push("L" + fmt(p.x) + " " + fmt(p.y)); return; } // straight-through / hairpin
+    const tanPhi = cosH / sinH;                     // tan of the interior half-angle
+    // perpendicular offset of this corridor track from the bundle centerline,
+    // signed toward the turn's center: the inner track's fillet must be
+    // tighter by exactly this amount, the outer's wider, so arcs share a center
+    let shift = 0;
+    if (refPts) {
+      const ref = refPts[((i % n) + n) % n];
+      shift = ((p.x - ref.x) * cx + (p.y - ref.y) * cy) / (sinH * 2) * cosH;
+    }
+    // `radius` is the fillet radius at any angle — shallow 45° bends turn on a
+    // short tangent and read nearly angular, like the reference map; the base
+    // is raised if needed so the bundle's innermost track keeps a real arc
+    const bh = halo ? halo[((i % n) + n) % n] : 0;
+    let rho = Math.max(2, Math.max(radius, bh + 2) - shift);
+    const t = Math.min(rho / tanPhi, l1 * 0.5, l2 * 0.5); // tangent length along each leg
+    if (t < 0.5) { d.push("L" + fmt(p.x) + " " + fmt(p.y)); return; }
+    rho = t * tanPhi;
+    const e1 = { x: p.x - u1.x * t, y: p.y - u1.y * t };
+    const e2 = { x: p.x + u2.x * t, y: p.y + u2.y * t };
+    const sweep = u1.x * u2.y - u1.y * u2.x > 0 ? 1 : 0;
     d.push("L" + fmt(e1.x) + " " + fmt(e1.y),
-           "Q" + fmt(p.x) + " " + fmt(p.y) + " " + fmt(e2.x) + " " + fmt(e2.y));
+           "A" + fmt(rho) + " " + fmt(rho) + " 0 0 " + sweep + " " + fmt(e2.x) + " " + fmt(e2.y));
   };
   if (closed) {
     const m = { x: (P(0).x + P(1).x) / 2, y: (P(0).y + P(1).y) / 2 };
@@ -680,7 +765,7 @@ function buildScene(g) {
     if (line.points.length < 2 || line.visible === false) continue;
     const rp = geom.get(line.id);
     const stationAt = line.points.map((p) => !!p.station);
-    const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, line.points);
+    const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, centerCache.get(line.id), haloCache.get(line.id));
     const op = (line.opacity == null ? 100 : line.opacity) / 100;
     const target = op < 1 ? el("g", { opacity: fmt(op) }) : gLines;
     const casing = +line.casing || 0;
@@ -1063,7 +1148,7 @@ function renderNavigator() {
     if (line.points.length < 2 || line.visible === false) continue;
     const rp = geomCache.get(line.id) || line.points;
     const stationAt = line.points.map((p) => !!p.station);
-    const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, line.points);
+    const d = buildPathD(rp, line.closed, lineCorner(line), stationAt, centerCache.get(line.id), haloCache.get(line.id));
     g.append(el("path", { d, fill: "none", stroke: line.color, "stroke-width": Math.max(line.width, 6), "stroke-linejoin": "round", "stroke-linecap": "round" }));
   }
   svg2.append(g);
